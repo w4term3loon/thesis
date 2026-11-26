@@ -1,0 +1,84 @@
+Subject: [PATCH 10] bpf: keep detailed capability traces at debug level
+
+Base: patches 0001-0004, 0006 and 0008. Keep authority creation, admission
+summaries and failures visible. Per-instruction verifier/JIT traces and
+per-lookup capability dumps are diagnostic only; historical targets that
+do not select this patch retain their original output.
+
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index 15a1b2cb3..c57fcef22 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -1787,7 +1787,7 @@ static void inspect_array_storage_cap(const struct bpf_map *map, u32 map_index)
+ 	cheri_perms_t perms = cheri_perms_get(cap);
+ 	u64 length = (u64)map->max_entries * array->elem_size;
+ 
+-	pr_info("BPF_ARRAY_ROOT stage=jit map_index=%u tag=%d base_matches=%d length=%llu storage_bytes=%llu read=%d write=%d exec=%d load_cap=%d store_cap=%d\n",
++	pr_debug("BPF_ARRAY_ROOT stage=jit map_index=%u tag=%d base_matches=%d length=%llu storage_bytes=%llu read=%d write=%d exec=%d load_cap=%d store_cap=%d\n",
+ 		map_index, cheri_tag_get(cap),
+ 		cheri_base_get(cap) == (unsigned long)array->value,
+ 		(u64)cheri_length_get(cap), length,
+@@ -1824,7 +1824,7 @@ static void inspect_object_meta(const struct bpf_prog *prog)
+ 		    insn->off || insn->imm)
+ 			return;
+ 		access = bpf_map_flags_to_cap(map);
+-		pr_info("BPF_OBJECT_META stage=jit prog=%s pc=%u kind=array_value_result dst=r%u map_index=%u map_type=%u value_size=%u map_flags=%#x read=%d write=%d\n",
++		pr_debug("BPF_OBJECT_META stage=jit prog=%s pc=%u kind=array_value_result dst=r%u map_index=%u map_type=%u value_size=%u map_flags=%#x read=%d write=%d\n",
+ 			aux->name, i, insn->dst_reg, meta->map_index,
+ 			map->map_type, map->value_size, map->map_flags,
+ 			!!(access & BPF_MAP_CAN_READ), !!(access & BPF_MAP_CAN_WRITE));
+@@ -1941,7 +1941,7 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 			    cheri_representable_length(size) != size ||
+ 			    ((((unsigned long)array->value + off) | array->elem_size) & ~mask))
+ 				goto unsupported_insn;
+-			pr_info("BPF_ACCESS_META stage=jit prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
++			pr_debug("BPF_ACCESS_META stage=jit prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
+ 				aux->name, i, off, insn->off, size);
+ 		}
+ 		if (meta->kind == BPF_OBJECT_STACK_LOAD ||
+@@ -1960,11 +1960,11 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 	if (!counts[BPF_OBJECT_ARRAY_VALUE_RESULT])
+ 		goto unsupported_profile;
+ 	ctx->array_map = map;
+-	pr_info("BPF_ARRAY_CAP stage=jit prog=%s lookups=%u copies=%u offsets=%u loads=%u stores=%u\n",
++	pr_debug("BPF_ARRAY_CAP stage=jit prog=%s lookups=%u copies=%u offsets=%u loads=%u stores=%u\n",
+ 		aux->name, counts[BPF_OBJECT_ARRAY_VALUE_RESULT],
+ 		counts[BPF_OBJECT_ARRAY_COPY], counts[BPF_OBJECT_ARRAY_OFFSET],
+ 		counts[BPF_OBJECT_ARRAY_LOAD], counts[BPF_OBJECT_ARRAY_STORE]);
+-	pr_info("BPF_STACK_CAP prog=%s frame_size=%u exact=1 read=1 write=1 cap_load=0 cap_store=0 copies=%u offsets=%u loads=%u stores=%u\n",
++	pr_debug("BPF_STACK_CAP prog=%s frame_size=%u exact=1 read=1 write=1 cap_load=0 cap_store=0 copies=%u offsets=%u loads=%u stores=%u\n",
+ 		aux->name, ctx->stack_size, counts[BPF_OBJECT_STACK_COPY],
+ 		counts[BPF_OBJECT_STACK_OFFSET], counts[BPF_OBJECT_STACK_LOAD],
+ 		counts[BPF_OBJECT_STACK_STORE]);
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index 5b15dec8c..2eedaa6da 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -94,7 +94,7 @@ void * __capability bpf_array_value_cap(const struct bpf_map *map,
+ 	    cheri_length_get(child) != map->value_size)
+ 		return NULL;
+ 	perms = cheri_perms_get(child);
+-	pr_info("BPF_ARRAY_VALUE stage=runtime index=%lu tag=%d base_matches=1 length=%llu parent_length=%llu read=%d write=%d exec=%d load_cap=%d store_cap=%d\n",
++	pr_debug("BPF_ARRAY_VALUE stage=runtime index=%lu tag=%d base_matches=1 length=%llu parent_length=%llu read=%d write=%d exec=%d load_cap=%d store_cap=%d\n",
+ 		offset / array->elem_size, cheri_tag_get(child),
+ 		(u64)cheri_length_get(child), (u64)cheri_length_get(parent),
+ 		!!(perms & CHERI_PERM_LOAD), !!(perms & CHERI_PERM_STORE),
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 8a49ff7d7..e54faff1a 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19568,11 +19568,11 @@ static int publish_object_meta(struct bpf_verifier_env *env)
+ 	for (i = 0; i < prog->len; i++) {
+ 		meta[i] = env->insn_aux_data[i].object_meta;
+ 		if (meta[i].kind == BPF_OBJECT_ARRAY_VALUE_RESULT)
+-			pr_info("BPF_OBJECT_META stage=verifier prog=%s pc=%u kind=array_value_result map_index=%u\n",
++			pr_debug("BPF_OBJECT_META stage=verifier prog=%s pc=%u kind=array_value_result map_index=%u\n",
+ 				prog->aux->name, i, meta[i].map_index);
+ 		if (meta[i].kind == BPF_OBJECT_ARRAY_LOAD ||
+ 		    meta[i].kind == BPF_OBJECT_ARRAY_STORE)
+-			pr_info("BPF_ACCESS_META stage=verifier prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
++			pr_debug("BPF_ACCESS_META stage=verifier prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
+ 				prog->aux->name, i, meta[i].access_off,
+ 				prog->insnsi[i].off, meta[i].access_size);
+ 	}
+

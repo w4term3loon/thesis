@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+/bin/busybox mount -t proc proc /proc
+printf '1\n' > /proc/sys/net/core/bpf_jit_enable
+/bin/sh /target
+exec /bin/busybox poweroff -f

@@ -1,0 +1,472 @@
+Subject: [PATCH 6] bpf: isolate and bound each invocation's BPF stack frame
+
+Base: patches 0001-0004 on the pinned Leaf RFC.
+
+Reserve and zero the 16-byte-aligned BPF frame on the invoking kernel stack,
+above the private Executive gateway context. Concurrent and nested invocations therefore
+have separate live storage; no per-program or per-CPU stack is shared. Release
+the reservation in the Executive epilogue. Unprotected Leaf programs retain
+their legacy stack allocation.
+
+Derive R10 from the invocation's exactly bounded CSP. Set exact
+frame bounds and retain only global/load/store permissions. Track stack
+copies, constant offsets and FP-relative access contracts; preserve the key
+contract through ARRAY lookup inlining. The gateway already saves full
+capability registers. Emit stack accesses through frame-derived capabilities.
+
+Scope remains one ordinary mmapable ARRAY and SOCKET_FILTER, with no pointer
+spills, remaining helpers, subprograms or variable pointer arithmetic. This
+is not the next milestone's complete-mediation claim: unmarked instructions
+still take the existing JIT path, and Leaf's broad RDDC is unchanged.
+
+---
+diff --git a/arch/arm64/net/bpf_jit.h b/arch/arm64/net/bpf_jit.h
+index 009b23a48..9142fe65c 100644
+--- a/arch/arm64/net/bpf_jit.h
++++ b/arch/arm64/net/bpf_jit.h
+@@ -19,12 +19,13 @@
+ /* Morello A64 capability operands; memory forms use a capability base. */
+ #define M64_MOV(Cd, Cn) (0xc2c1d000 | ((Cn) << 5) | (Cd))
+ #define M64_ADD(Cd, Cn, Xm) (0xc2a06000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
++#define M64_SUB_I(Cd, Cn, imm12) (0x02800000 | ((imm12) << 10) | ((Cn) << 5) | (Cd))
+ #define M64_BLR(Cn) (0xc2c23000 | ((Cn) << 5))
+ #define M64_GCBASE(Xd, Cn) (0xc2c01000 | ((Cn) << 5) | (Xd))
+ #define M64_GCVALUE(Xd, Cn) (0xc2c05000 | ((Cn) << 5) | (Xd))
+ #define M64_SCVALUE(Cd, Cn, Xm) (0xc2c04000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
+ #define M64_SCBNDSE(Cd, Cn, Xm) (0xc2c02000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
+ #define M64_CLRPERM(Cd, Cn, Xm) (0xc2c0a000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
+ #define M64_MEM(load, size, Rt, Cn) \
+ 	(0xe2000000 | ((size) << 22) | ((load) << 10) | ((Cn) << 5) | (Rt))
+ 
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index d3d48d8cb..d26201516 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -274,6 +274,6 @@
+ extern void bpf_array_cap_gate(void);
+ 
+-void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, bool array_caps)
++void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size)
+ {
+ 	void * __capability ddc;
+ 	void * __capability rcsp;
+@@ -283,5 +283,6 @@ void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size)
+ 	void * __capability gate = NULL;
+ 	void *lr;
++	u32 stack_size = frame_size ?: BPF_STACK_SZ;
+ 
+ 	/*
+ 	 * All new caps are explicitly derived from kernel DDC; since EL1 DDC is
+@@ -292,7 +293,7 @@ void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size)
+-	/* Setup RCSP to top of new stack created in vmalloc region */
++	/* Protected storage was reserved by this invocation's JIT prologue. */
+ 	rcsp = cheri_address_set(ddc, (u64)sp);
+-	rcsp = cheri_bounds_set(rcsp, BPF_STACK_SZ);
+-	rcsp = cheri_offset_set(rcsp, BPF_STACK_SZ);
++	rcsp = cheri_bounds_set_exact(rcsp, stack_size);
++	rcsp = cheri_offset_set(rcsp, stack_size);
+ 	asm volatile("msr rcsp_el0, %[RCSP]" :: [RCSP] "C" (rcsp));
+ 
+ 	/* Restrict RDDC to the vmalloc region */
+@@ -346,7 +347,7 @@ void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size)
+ 	 */
+ 	clr = cheri_address_set(ddc, (u64)ret_addr);
+ 	clr = cheri_sentry_create(clr);
+-	if (array_caps)
++	if (frame_size)
+ 		gate = cheri_sentry_create(cheri_address_set(ddc,
+ 						 (u64)bpf_array_cap_gate));
+ 	__asm__ volatile(
+@@ -452,23 +453,30 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 	emit(A64_PUSH(A64_R(23), A64_R(24), A64_SP), ctx);
+ 	emit(A64_PUSH(A64_R(25), A64_R(26), A64_SP), ctx);
+ 	emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
++	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
+ 	if (ctx->array_map) {
++		/* Reserve fresh data without exposing previous kernel-stack bytes. */
++		for (u32 offset = 0; offset < ctx->stack_size; offset += 16)
++			emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
++		emit(A64_MOV(1, A64_R(0), A64_SP), ctx);
+ 		/* Private executive stack context; the gate ignores BPF map args. */
+ 		emit_addr_mov_i64(A64_R(10), (u64)ctx->array_map, ctx);
+ 		emit(A64_PUSH(A64_R(10), A64_ZR, A64_SP), ctx);
++	} else {
++		emit_addr_mov_i64(A64_R(0), (const u64)ctx->stack, ctx);
+ 	}
+ 
+ 	/* Setup and enter restricted mode compartment:
+-	 *	arg1: new SP
++	 *	arg1: stack allocation base
+ 	 *	arg2: PCC-relative address of where we want to return to on
+ 	 *	      exiting restricted mode
+ 	 *	arg3: image size
++	 *	arg4: protected frame size, or zero for the legacy stack
+ 	 */
+-	emit_addr_mov_i64(A64_R(0), (const u64)ctx->stack, ctx);
+ 	/* byte offset = idx * sizeof(inst) + sizeof(emit_call) */
+ 	emit(A64_ADR(A64_R(1), (epilogue_offset(ctx)*4)+4), ctx);
+ 	emit_a64_mov_i(0, A64_R(2), ctx->image_size, ctx);
+-	emit_a64_mov_i(0, A64_R(3), !!ctx->array_map, ctx);
++	emit_a64_mov_i(0, A64_R(3), ctx->array_map ? ctx->stack_size : 0, ctx);
+ 	emit_call((const u64)bpf_enter_sandbox, ctx);
+ 	/* ----> Now we're in restricted mode */
+ 
+@@ -499,8 +507,23 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+-	/* Stack must be multiples of 16B */
+-	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
+-
+ 	/* Set up function call stack */
+-	emit(A64_SUB_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
++	if (ctx->array_map) {
++		const u8 tmp = bpf2a64[TMP_REG_1];
++
++		/* Integer SUB SP would clear the tag before we derive the frame. */
++		emit(M64_SUB_I(A64_SP, A64_SP, ctx->stack_size), ctx);
++		/* Derive from the allocated restricted stack, never from DDC.
++		 * CSP now addresses the frame bottom; BPF FP points one past it.
++		 * Native saves and gate state are outside this frame's bounds.
++		 */
++		emit(M64_MOV(fp, A64_SP), ctx);
++		emit_a64_mov_i(1, tmp, ctx->stack_size, ctx);
++		emit(M64_SCBNDSE(fp, fp, tmp), ctx);
++		emit(M64_ADD(fp, fp, tmp), ctx);
++		emit_a64_mov_i64(tmp, ~(u64)(CHERI_PERM_GLOBAL |
++					   CHERI_PERM_LOAD | CHERI_PERM_STORE), ctx);
++		emit(M64_CLRPERM(fp, fp, tmp), ctx);
++	} else {
++		emit(A64_SUB_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
++	}
+ 	return 0;
+ }
+ 
+@@ -793,7 +816,7 @@ static void build_epilogue(struct jit_ctx *ctx)
+ 	emit(0xc2c253c0, ctx); // ret clr
+ 	/* ----> Now we're back in executive mode */
+ 	if (ctx->array_map)
+-		emit(A64_ADD_I(1, A64_SP, A64_SP, 16), ctx);
++		emit(A64_ADD_I(1, A64_SP, A64_SP, 16 + ctx->stack_size), ctx);
+ 
+ 	/* Restore x19-x28 */
+ 	emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
+@@ -892,7 +915,8 @@ static int emit_array_cap_insn(const struct bpf_insn *insn,
+ 	u8 dst = bpf2a64[insn->dst_reg], src = bpf2a64[insn->src_reg];
+ 	u8 tmp = bpf2a64[TMP_REG_1], tmp2 = bpf2a64[TMP_REG_2];
+ 	u8 tmp3 = bpf2a64[TMP_REG_3], kind = meta->kind;
+-	bool load = kind == BPF_OBJECT_ARRAY_LOAD;
++	bool load = kind == BPF_OBJECT_ARRAY_LOAD || kind == BPF_OBJECT_STACK_LOAD;
++	bool stack = kind == BPF_OBJECT_STACK_LOAD || kind == BPF_OBJECT_STACK_STORE;
+ 	u8 base = load ? src : dst, value = load ? dst : src;
+ 	s64 offset;
+ 	int size;
+@@ -905,9 +929,11 @@ static int emit_array_cap_insn(const struct bpf_insn *insn,
+ 		emit(M64_MOV(A64_LR, A64_R(24)), ctx);
+ 		return 0;
+ 	case BPF_OBJECT_ARRAY_COPY:
++	case BPF_OBJECT_STACK_COPY:
+ 		emit(M64_MOV(dst, src), ctx);
+ 		return 0;
+ 	case BPF_OBJECT_ARRAY_OFFSET:
++	case BPF_OBJECT_STACK_OFFSET:
+ 		offset = insn->imm;
+ 		if (BPF_OP(insn->code) == BPF_SUB)
+ 			offset = -offset;
+@@ -916,14 +942,17 @@ static int emit_array_cap_insn(const struct bpf_insn *insn,
+ 		return 0;
+ 	case BPF_OBJECT_ARRAY_LOAD:
+ 	case BPF_OBJECT_ARRAY_STORE:
++	case BPF_OBJECT_STACK_LOAD:
++	case BPF_OBJECT_STACK_STORE:
+ 		size = bpf_size_to_bytes(BPF_SIZE(insn->code));
+ 		if (size < 0)
+ 			return -EINVAL;
+-		/* The verifier's window is anchored to the element BASE, not
+-		 * the current cursor. Keep the original element capability intact.
++		/* Anchor the window to the object base, never the runtime cursor.
++		 * Stack contracts record a distance below the original BPF FP.
+ 		 */
+ 		emit(M64_GCBASE(tmp2, base), ctx);
+-		emit_a64_mov_i64(tmp3, meta->access_off, ctx);
++		emit_a64_mov_i64(tmp3, stack ? ctx->stack_size - meta->access_off :
++					     meta->access_off, ctx);
+ 		emit(A64_ADD(1, tmp2, tmp2, tmp3), ctx);
+ 		emit(M64_SCVALUE(tmp, base, tmp2), ctx);
+ 		emit_a64_mov_i(1, tmp3, meta->access_size, ctx);
+@@ -1794,6 +1823,12 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 
+ 	if (!aux->array_caps)
+ 		return 0;
++	ctx->stack_size = round_up(aux->stack_depth, 16);
++	mask = cheri_representable_alignment_mask(ctx->stack_size);
++	if (!aux->stack_depth || aux->stack_depth > MAX_BPF_STACK ||
++	    cheri_representable_length(ctx->stack_size) != ctx->stack_size ||
++	    ((16 | ctx->stack_size) & ~mask))
++		goto unsupported_profile;
+ 	/* The gateway's private context and saved capabilities must not be
+ 	 * reachable through Leaf's vmalloc RDDC (including via kernel stacks).
+ 	 */
+@@ -1838,19 +1873,23 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_ARRAY_COPY:
++		case BPF_OBJECT_STACK_COPY:
+ 			if (insn->code != (BPF_ALU64 | BPF_MOV | BPF_X) || insn->off)
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_ARRAY_OFFSET:
++		case BPF_OBJECT_STACK_OFFSET:
+ 			if (insn->code != (BPF_ALU64 | BPF_ADD | BPF_K) &&
+ 			    insn->code != (BPF_ALU64 | BPF_SUB | BPF_K))
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_ARRAY_LOAD:
++		case BPF_OBJECT_STACK_LOAD:
+ 			if (class != BPF_LDX || BPF_MODE(insn->code) != BPF_MEM)
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_ARRAY_STORE:
++		case BPF_OBJECT_STACK_STORE:
+ 			if ((class != BPF_ST && class != BPF_STX) ||
+ 			    BPF_MODE(insn->code) != BPF_MEM)
+ 				goto unsupported_insn;
+@@ -1871,6 +1910,17 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 			pr_info("BPF_ACCESS_META stage=jit prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
+ 				aux->name, i, off, insn->off, size);
+ 		}
++		if (meta->kind == BPF_OBJECT_STACK_LOAD ||
++		    meta->kind == BPF_OBJECT_STACK_STORE) {
++			u32 size = meta->access_size, distance = meta->access_off;
++
++			mask = cheri_representable_alignment_mask(size);
++			if (!size || size != bpf_size_to_bytes(BPF_SIZE(insn->code)) ||
++			    distance < size || distance > ctx->stack_size ||
++			    cheri_representable_length(size) != size ||
++			    ((16 | ctx->stack_size | distance) & ~mask))
++				goto unsupported_insn;
++		}
+ 		counts[meta->kind]++;
+ 	}
+ 	if (!counts[BPF_OBJECT_ARRAY_VALUE_RESULT])
+@@ -1880,6 +1930,10 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 		aux->name, counts[BPF_OBJECT_ARRAY_VALUE_RESULT],
+ 		counts[BPF_OBJECT_ARRAY_COPY], counts[BPF_OBJECT_ARRAY_OFFSET],
+ 		counts[BPF_OBJECT_ARRAY_LOAD], counts[BPF_OBJECT_ARRAY_STORE]);
++	pr_info("BPF_STACK_CAP prog=%s frame_size=%u exact=1 read=1 write=1 cap_load=0 cap_store=0 copies=%u offsets=%u loads=%u stores=%u\n",
++		aux->name, ctx->stack_size, counts[BPF_OBJECT_STACK_COPY],
++		counts[BPF_OBJECT_STACK_OFFSET], counts[BPF_OBJECT_STACK_LOAD],
++		counts[BPF_OBJECT_STACK_STORE]);
+ 	return 0;
+ 
+ unsupported_insn:
+@@ -1990,8 +2044,13 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+-	if (header->stack == NULL) {
+-		goto out_off;
++	if (!ctx.array_map) {
++		header->stack = bpf_jit_alloc_stack();
++		if (!header->stack) {
++			bpf_jit_binary_free(header);
++			prog = orig_prog;
++			goto out_off;
++		}
+ 	}
+ 	ctx.stack = header->stack;
+ 
+ 	/* 2. Now, the actual pass. */
+ 
+ 	ctx.image = (__le32 *)image_ptr;
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 69499c817..3fe39291d 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1409,13 +1409,18 @@ enum bpf_object_kind {
+ 	BPF_OBJECT_ARRAY_OFFSET,
+ 	BPF_OBJECT_ARRAY_LOAD,
+ 	BPF_OBJECT_ARRAY_STORE,
++	BPF_OBJECT_STACK_COPY,
++	BPF_OBJECT_STACK_OFFSET,
++	BPF_OBJECT_STACK_LOAD,
++	BPF_OBJECT_STACK_STORE,
++	BPF_OBJECT_STACK_KEY,
+ 	BPF_OBJECT_UNSUPPORTED,
+ };
+ 
+ /* Object identity and exact access contracts, never parent authority. */
+ struct bpf_object_meta {
+ 	u32 map_index;
+-	u32 access_off;
++	u32 access_off; /* Element offset, or positive distance below BPF FP. */
+ 	u8 kind;
+ 	u8 access_size;
+ };
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1070,8 +1070,8 @@ bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
+ 	/*
+-	 * Save the bpf SP in the header; it's the easiest way to ensure the
+-	 * memory is free'd at the same time as the image in bpf_jit_binary_free
++	 * The architecture may attach a legacy stack. Protected invocations
++	 * reserve their frame on the calling kernel stack instead.
+ 	 */
+-	hdr->stack = bpf_jit_alloc_stack();
++	hdr->stack = NULL;
+ 
+ 	return hdr;
+ }
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 9ece1e682..2a503d433 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -17410,7 +17410,7 @@ static bool is_array_value_reg(const struct bpf_reg_state *reg)
+ 	       reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY;
+ }
+ 
+-/* Retain use semantics and constant element-relative access contracts. */
++/* Retain use semantics and constant object-relative access contracts. */
+ static void record_array_value_use(struct bpf_verifier_env *env,
+ 				   const struct bpf_insn *insn,
+ 				   const struct bpf_reg_state *regs)
+@@ -17420,40 +17420,49 @@ static void record_array_value_use(struct bpf_verifier_env *env,
+ 	u8 kind = BPF_OBJECT_NONE;
+ 	u32 access_off = 0;
+ 	u8 access_size = 0;
+-	bool dst, src;
++	bool dst, src, dst_stack, src_stack;
+ 	int r;
+ 
+ 	if (!IS_ENABLED(CONFIG_ARM64_MORELLO) ||
+ 	    insn->dst_reg >= MAX_BPF_REG || insn->src_reg >= MAX_BPF_REG)
+ 		return;
+-	dst = is_array_value_reg(&regs[insn->dst_reg]);
+-	src = is_array_value_reg(&regs[insn->src_reg]);
++	dst_stack = regs[insn->dst_reg].type == PTR_TO_STACK;
++	src_stack = regs[insn->src_reg].type == PTR_TO_STACK;
++	dst = dst_stack || is_array_value_reg(&regs[insn->dst_reg]);
++	src = src_stack || is_array_value_reg(&regs[insn->src_reg]);
+ 	if (class == BPF_ALU || class == BPF_ALU64) {
+ 		if (op == BPF_MOV) {
+-			if (BPF_SRC(insn->code) == BPF_X && src)
+-				kind = class == BPF_ALU64 && !insn->off ?
+-					BPF_OBJECT_ARRAY_COPY : BPF_OBJECT_UNSUPPORTED;
++			if (BPF_SRC(insn->code) == BPF_X && src) {
++				kind = src_stack ? BPF_OBJECT_STACK_COPY : BPF_OBJECT_ARRAY_COPY;
++				if (class != BPF_ALU64 || insn->off)
++					kind = BPF_OBJECT_UNSUPPORTED;
++			}
+ 		} else if (dst || (BPF_SRC(insn->code) == BPF_X && src)) {
+-			kind = dst && class == BPF_ALU64 &&
+-			       BPF_SRC(insn->code) == BPF_K &&
+-			       (op == BPF_ADD || op == BPF_SUB) ?
+-				BPF_OBJECT_ARRAY_OFFSET : BPF_OBJECT_UNSUPPORTED;
++			kind = dst_stack ? BPF_OBJECT_STACK_OFFSET : BPF_OBJECT_ARRAY_OFFSET;
++			if (!dst || class != BPF_ALU64 || BPF_SRC(insn->code) != BPF_K ||
++			    (op != BPF_ADD && op != BPF_SUB))
++				kind = BPF_OBJECT_UNSUPPORTED;
+ 		}
+ 	} else if (class == BPF_LDX) {
+ 		if (src && BPF_MODE(insn->code) == BPF_MEM)
+-			kind = BPF_OBJECT_ARRAY_LOAD;
+-		else if (regs[insn->src_reg].type != PTR_TO_STACK)
++			kind = src_stack ? BPF_OBJECT_STACK_LOAD : BPF_OBJECT_ARRAY_LOAD;
++		else
+ 			kind = BPF_OBJECT_UNSUPPORTED;
+ 	} else if (class == BPF_ST || class == BPF_STX) {
+ 		if (dst && BPF_MODE(insn->code) == BPF_MEM)
+-			kind = BPF_OBJECT_ARRAY_STORE;
+-		else if (regs[insn->dst_reg].type != PTR_TO_STACK)
++			kind = dst_stack ? BPF_OBJECT_STACK_STORE : BPF_OBJECT_ARRAY_STORE;
++		else
+ 			kind = BPF_OBJECT_UNSUPPORTED;
+ 		/* Eight-byte BPF spills cannot preserve a Morello capability. */
+ 		if (class == BPF_STX && src)
+ 			kind = BPF_OBJECT_UNSUPPORTED;
+ 	} else if (class == BPF_JMP || class == BPF_JMP32) {
+ 		if (op == BPF_CALL) {
++			if (!insn->src_reg && insn->imm == BPF_FUNC_map_lookup_elem &&
++			    regs[BPF_REG_1].type == CONST_PTR_TO_MAP &&
++			    regs[BPF_REG_1].map_ptr->map_type == BPF_MAP_TYPE_ARRAY &&
++			    regs[BPF_REG_2].type == PTR_TO_STACK)
++				kind = BPF_OBJECT_STACK_KEY;
+ 			/* Includes lookup keys supplied through an array-value pointer. */
+ 			for (r = BPF_REG_1; r <= BPF_REG_5; r++)
+ 				if (is_array_value_reg(&regs[r]))
+@@ -17486,6 +17495,25 @@ static void record_array_value_use(struct bpf_verifier_env *env,
+ 			access_size = size;
+ 		}
+ 	}
++	if (kind == BPF_OBJECT_STACK_LOAD || kind == BPF_OBJECT_STACK_STORE ||
++	    kind == BPF_OBJECT_STACK_KEY) {
++		const struct bpf_reg_state *reg = &regs[kind == BPF_OBJECT_STACK_KEY ?
++			BPF_REG_2 : kind == BPF_OBJECT_STACK_LOAD ? insn->src_reg : insn->dst_reg];
++		int size = kind == BPF_OBJECT_STACK_KEY ? sizeof(u32) :
++			   bpf_size_to_bytes(BPF_SIZE(insn->code));
++		s64 off;
++
++		if (!tnum_is_const(reg->var_off) || size <= 0 ||
++		    check_add_overflow((s64)reg->var_off.value, (s64)reg->off, &off) ||
++		    check_add_overflow(off, kind == BPF_OBJECT_STACK_KEY ? 0LL :
++				      (s64)insn->off, &off) ||
++		    off >= 0 || off < -MAX_BPF_STACK || size > -off) {
++			kind = BPF_OBJECT_UNSUPPORTED;
++		} else {
++			access_off = -off;
++			access_size = size;
++		}
++	}
+ 	/* A single contract must hold on every explored path; never widen it. */
+ 	if (aux->object_meta_seen &&
+ 	    (aux->object_meta.kind != kind ||
+@@ -19462,14 +19490,22 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
+ }
+ 
+ static void record_array_lookup_result(struct bpf_verifier_env *env,
+-				       struct bpf_map *map, u32 off, u32 cnt)
++				       struct bpf_map *map, u32 off, u32 cnt,
++				       const struct bpf_object_meta *key)
+ {
+ 	struct bpf_object_meta *meta;
+ 	const struct bpf_insn *insn;
+ 	u32 map_index, pc;
+ 
+ 	if (env->subprog_cnt != 1 || env->prog->blinding_requested ||
+-	    map->map_type != BPF_MAP_TYPE_ARRAY || map->record || cnt < 3)
++	    map->map_type != BPF_MAP_TYPE_ARRAY || map->record || cnt < 3 ||
++	    key->kind != BPF_OBJECT_STACK_KEY)
++		return;
++	/* The generated key read must keep its stack contract after inlining. */
++	insn = &env->prog->insnsi[off + 1];
++	if (insn->code != (BPF_LDX | BPF_MEM | BPF_W) ||
++	    insn->dst_reg != BPF_REG_0 || insn->src_reg != BPF_REG_2 ||
++	    insn->off || insn->imm)
+ 		return;
+ 
+ 	/* The pinned array generator ends with ADD r0,r1; JA; MOV r0,0. */
+@@ -19489,6 +19525,11 @@ static void record_array_lookup_result(struct bpf_verifier_env *env,
+ 	meta = &env->insn_aux_data[pc].object_meta;
+ 	meta->kind = BPF_OBJECT_ARRAY_VALUE_RESULT;
+ 	meta->map_index = map_index;
++	meta = &env->insn_aux_data[off + 1].object_meta;
++	*meta = *key;
++	meta->kind = BPF_OBJECT_STACK_LOAD;
++	/* The original call's record moved onto the generated NULL assignment. */
++	env->insn_aux_data[off + cnt - 1].object_meta = (struct bpf_object_meta){};
+ }
+ 
+ static int publish_object_meta(struct bpf_verifier_env *env)
+@@ -19883,6 +19924,8 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
+ 			ops = map_ptr->ops;
+ 			if (insn->imm == BPF_FUNC_map_lookup_elem &&
+ 			    ops->map_gen_lookup) {
++				struct bpf_object_meta key = aux->object_meta;
++
+ 				cnt = ops->map_gen_lookup(map_ptr, insn_buf);
+ 				if (cnt == -EOPNOTSUPP)
+ 					goto patch_map_ops_generic;
+@@ -19897,7 +19940,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
+ 					return -ENOMEM;
+ 
+ 				env->prog = prog = new_prog;
+-				record_array_lookup_result(env, map_ptr, i + delta, cnt);
++				record_array_lookup_result(env, map_ptr, i + delta, cnt, &key);
+ 				delta    += cnt - 1;
+ 				insn      = new_prog->insnsi + i + delta;
+ 				continue;

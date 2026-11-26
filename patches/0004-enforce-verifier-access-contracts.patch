@@ -1,0 +1,197 @@
+Subject: [PATCH 4] bpf: enforce verifier-directed access bounds and permissions
+
+Derive each temporary C_access from the unchanged object capability, using
+the verifier's object-relative offset, width and existing LOAD/STORE kind.
+Retain only the requested data direction. Install the runtime cursor after
+bounding; neither an incorrect cursor nor metadata can widen object authority.
+
+diff --git a/arch/arm64/net/bpf_jit.h b/arch/arm64/net/bpf_jit.h
+index e32469417..009b23a48 100644
+--- a/arch/arm64/net/bpf_jit.h
++++ b/arch/arm64/net/bpf_jit.h
+@@ -20,6 +20,11 @@
+ #define M64_MOV(Cd, Cn) (0xc2c1d000 | ((Cn) << 5) | (Cd))
+ #define M64_ADD(Cd, Cn, Xm) (0xc2a06000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
+ #define M64_BLR(Cn) (0xc2c23000 | ((Cn) << 5))
++#define M64_GCBASE(Xd, Cn) (0xc2c01000 | ((Cn) << 5) | (Xd))
++#define M64_GCVALUE(Xd, Cn) (0xc2c05000 | ((Cn) << 5) | (Xd))
++#define M64_SCVALUE(Cd, Cn, Xm) (0xc2c04000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
++#define M64_SCBNDSE(Cd, Cn, Xm) (0xc2c02000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
++#define M64_CLRPERM(Cd, Cn, Xm) (0xc2c0a000 | ((Xm) << 16) | ((Cn) << 5) | (Cd))
+ #define M64_MEM(load, size, Rt, Cn) \
+ 	(0xe2000000 | ((size) << 22) | ((load) << 10) | ((Cn) << 5) | (Rt))
+ 
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index 211a3316a..d3d48d8cb 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -885,11 +885,13 @@ static int add_exception_handler(const struct bpf_insn *insn,
+  * >0 - successfully JITed a 16-byte eBPF instruction.
+  * <0 - failed to JIT.
+  */
+-static int emit_array_cap_insn(const struct bpf_insn *insn, u8 kind,
++static int emit_array_cap_insn(const struct bpf_insn *insn,
++			       const struct bpf_object_meta *meta,
+ 			       struct jit_ctx *ctx)
+ {
+ 	u8 dst = bpf2a64[insn->dst_reg], src = bpf2a64[insn->src_reg];
+ 	u8 tmp = bpf2a64[TMP_REG_1], tmp2 = bpf2a64[TMP_REG_2];
++	u8 tmp3 = bpf2a64[TMP_REG_3], kind = meta->kind;
+ 	bool load = kind == BPF_OBJECT_ARRAY_LOAD;
+ 	u8 base = load ? src : dst, value = load ? dst : src;
+ 	s64 offset;
+@@ -917,9 +919,26 @@ static int emit_array_cap_insn(const struct bpf_insn *insn, u8 kind,
+ 		size = bpf_size_to_bytes(BPF_SIZE(insn->code));
+ 		if (size < 0)
+ 			return -EINVAL;
+-		/* Never choose an integer/RDDC fallback based on the tag. */
+-		emit_a64_mov_i(1, tmp2, insn->off, ctx);
+-		emit(M64_ADD(tmp, base, tmp2), ctx);
++		/* The verifier's window is anchored to the element BASE, not
++		 * the current cursor. Keep the original element capability intact.
++		 */
++		emit(M64_GCBASE(tmp2, base), ctx);
++		emit_a64_mov_i64(tmp3, meta->access_off, ctx);
++		emit(A64_ADD(1, tmp2, tmp2, tmp3), ctx);
++		emit(M64_SCVALUE(tmp, base, tmp2), ctx);
++		emit_a64_mov_i(1, tmp3, meta->access_size, ctx);
++		emit(M64_SCBNDSE(tmp, tmp, tmp3), ctx);
++		/* Direction is already encoded in the verified LOAD/STORE kind. */
++		emit_a64_mov_i64(tmp3, ~(u64)(load ? CHERI_PERM_LOAD : CHERI_PERM_STORE), ctx);
++		emit(M64_CLRPERM(tmp, tmp, tmp3), ctx);
++		/* Now install the actual effective address WITHOUT rebounding.
++		 * A mismatch faults at the capability-based memory instruction;
++		 * no integer/RDDC fallback is permitted.
++		 */
++		emit(M64_GCVALUE(tmp2, base), ctx);
++		emit_a64_mov_i(1, tmp3, insn->off, ctx);
++		emit(A64_ADD(1, tmp2, tmp2, tmp3), ctx);
++		emit(M64_SCVALUE(tmp, tmp, tmp2), ctx);
+ 		if (BPF_CLASS(insn->code) == BPF_ST) {
+ 			emit_a64_mov_i(1, tmp2, insn->imm, ctx);
+ 			value = tmp2;
+@@ -957,7 +973,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 
+ 	if (ctx->array_map && ctx->prog->aux->object_meta[i].kind)
+ 		return emit_array_cap_insn(insn,
+-					   ctx->prog->aux->object_meta[i].kind, ctx);
++					   &ctx->prog->aux->object_meta[i], ctx);
+ 
+ 	switch (code) {
+ 	/* dst = src */
+@@ -1842,6 +1858,19 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 		default:
+ 			goto unsupported_insn;
+ 		}
++		if (meta->kind == BPF_OBJECT_ARRAY_LOAD ||
++		    meta->kind == BPF_OBJECT_ARRAY_STORE) {
++			u32 size = meta->access_size, off = meta->access_off;
++
++			mask = cheri_representable_alignment_mask(size);
++			if (!size || size != bpf_size_to_bytes(BPF_SIZE(insn->code)) ||
++			    off > map->value_size || size > map->value_size - off ||
++			    cheri_representable_length(size) != size ||
++			    ((((unsigned long)array->value + off) | array->elem_size) & ~mask))
++				goto unsupported_insn;
++			pr_info("BPF_ACCESS_META stage=jit prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
++				aux->name, i, off, insn->off, size);
++		}
+ 		counts[meta->kind]++;
+ 	}
+ 	if (!counts[BPF_OBJECT_ARRAY_VALUE_RESULT])
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 94eda8339..69499c817 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1412,10 +1412,12 @@ enum bpf_object_kind {
+ 	BPF_OBJECT_UNSUPPORTED,
+ };
+ 
+-/* Semantic association only; bounds and permissions remain map properties. */
++/* Object identity and exact access contracts, never parent authority. */
+ struct bpf_object_meta {
+ 	u32 map_index;
++	u32 access_off;
+ 	u8 kind;
++	u8 access_size;
+ };
+ 
+ struct bpf_prog_aux {
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 691a41669..41d3882f9 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -27,6 +27,7 @@
+ #include <linux/module.h>
+ #include <linux/cpumask.h>
+ #include <linux/bpf_mem_alloc.h>
++#include <linux/overflow.h>
+ #include <net/xdp.h>
+ 
+ #include "disasm.h"
+@@ -17409,7 +17410,7 @@ static bool is_array_value_reg(const struct bpf_reg_state *reg)
+ 	       reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY;
+ }
+ 
+-/* Retain use semantics, never the verifier's numerical pointer bounds. */
++/* Retain use semantics and constant element-relative access contracts. */
+ static void record_array_value_use(struct bpf_verifier_env *env,
+ 				   const struct bpf_insn *insn,
+ 				   const struct bpf_reg_state *regs)
+@@ -17417,6 +17418,8 @@ static void record_array_value_use(struct bpf_verifier_env *env,
+ 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+ 	u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
+ 	u8 kind = BPF_OBJECT_NONE;
++	u32 access_off = 0;
++	u8 access_size = 0;
+ 	bool dst, src;
+ 	int r;
+ 
+@@ -17465,10 +17468,33 @@ static void record_array_value_use(struct bpf_verifier_env *env,
+ 		    insn->src_reg == BPF_PSEUDO_MAP_IDX_VALUE)) {
+ 		kind = BPF_OBJECT_UNSUPPORTED;
+ 	}
+-	/* Do not specialize an instruction whose meaning differs across paths. */
+-	if (aux->object_meta_seen && aux->object_meta.kind != kind)
++	if (kind == BPF_OBJECT_ARRAY_LOAD || kind == BPF_OBJECT_ARRAY_STORE) {
++		const struct bpf_reg_state *reg = &regs[kind == BPF_OBJECT_ARRAY_LOAD ?
++						      insn->src_reg : insn->dst_reg];
++		int size = bpf_size_to_bytes(BPF_SIZE(insn->code));
++		s64 off;
++
++		/* Include prior pointer arithmetic, not just insn->off. */
++		if (!tnum_is_const(reg->var_off) || size <= 0 ||
++		    check_add_overflow((s64)reg->var_off.value, (s64)reg->off, &off) ||
++		    check_add_overflow(off, (s64)insn->off, &off) || off < 0 ||
++		    off > reg->map_ptr->value_size ||
++		    size > reg->map_ptr->value_size - off) {
++			kind = BPF_OBJECT_UNSUPPORTED;
++		} else {
++			access_off = off;
++			access_size = size;
++		}
++	}
++	/* A single contract must hold on every explored path; never widen it. */
++	if (aux->object_meta_seen &&
++	    (aux->object_meta.kind != kind ||
++	     aux->object_meta.access_off != access_off ||
++	     aux->object_meta.access_size != access_size))
+ 		kind = BPF_OBJECT_UNSUPPORTED;
+ 	aux->object_meta.kind = kind;
++	aux->object_meta.access_off = access_off;
++	aux->object_meta.access_size = access_size;
+ 	aux->object_meta_seen = true;
+ }
+ 
+@@ -19498,6 +19524,11 @@ static int publish_object_meta(struct bpf_verifier_env *env)
+ 		if (meta[i].kind == BPF_OBJECT_ARRAY_VALUE_RESULT)
+ 			pr_info("BPF_OBJECT_META stage=verifier prog=%s pc=%u kind=array_value_result map_index=%u\n",
+ 				prog->aux->name, i, meta[i].map_index);
++		if (meta[i].kind == BPF_OBJECT_ARRAY_LOAD ||
++		    meta[i].kind == BPF_OBJECT_ARRAY_STORE)
++			pr_info("BPF_ACCESS_META stage=verifier prog=%s pc=%u element_off=%u insn_off=%d size=%u\n",
++				prog->aux->name, i, meta[i].access_off,
++				prog->insnsi[i].off, meta[i].access_size);
+ 	}
+ 	prog->aux->object_meta = meta;
+ 	prog->aux->object_meta_len = prog->len;

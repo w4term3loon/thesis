@@ -1,0 +1,192 @@
+Subject: [PATCH 2] bpf: give array maps a kernel-owned storage capability
+
+Base: patch 0001 on dfcb2dc498ff214dc8b3d8117ef7e8c7e7901152 (Leaf RFC)
+
+On Morello, create an exactly bounded parent capability for ordinary ARRAY
+value storage at allocation time. Its extent is max_entries * elem_size;
+the map header, page padding and speculative extra entries are excluded.
+Parent construction is optional: ordinary map creation remains valid if exact
+bounds or the authority allocation are unavailable. Protected JIT admission
+requires a valid parent and rejects such maps instead.
+
+The trusted allocator derives the parent from kernel DDC and immutable map
+properties, not verifier estimates or a BPF-provided address. Retain only
+Global and the map's program read/write permissions. Store the capability
+in a separate kmalloc object outside Leaf's vmalloc RDDC, and clear/free
+that object with the map. A kernel-only accessor requires a held map
+reference and is not exposed as a BPF helper.
+
+At patch 0001's JIT observation point, inspect the retained capability's
+tag, bounds and permissions. This validates map-owned authority plumbing;
+BPF memory instructions and Leaf's sandbox are unchanged. There is no
+per-element enforcement, negative access, or fault injection in this patch.
+
+---
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index 56ed27b0d..74bb5dfc4 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/bpf.h>
++#include <linux/cheri.h>
+ #include <linux/filter.h>
+ #include <linux/memory.h>
+ #include <linux/printk.h>
+@@ -1640,6 +1641,24 @@ void *bpf_jit_alloc_stack()
+ 	return kasan_reset_tag(sp);
+ }
+ 
++#ifdef CONFIG_ARM64_MORELLO
++static void inspect_array_storage_cap(const struct bpf_map *map, u32 map_index)
++{
++	const struct bpf_array *array = container_of(map, struct bpf_array, map);
++	void * __capability cap = bpf_array_storage_cap(map);
++	cheri_perms_t perms = cheri_perms_get(cap);
++	u64 length = (u64)map->max_entries * array->elem_size;
++
++	pr_info("BPF_ARRAY_ROOT stage=jit map_index=%u tag=%d base_matches=%d length=%llu storage_bytes=%llu read=%d write=%d exec=%d load_cap=%d store_cap=%d\n",
++		map_index, cheri_tag_get(cap),
++		cheri_base_get(cap) == (unsigned long)array->value,
++		(u64)cheri_length_get(cap), length,
++		!!(perms & CHERI_PERM_LOAD), !!(perms & CHERI_PERM_STORE),
++		!!(perms & CHERI_PERM_EXECUTE), !!(perms & CHERI_PERM_LOAD_CAP),
++		!!(perms & CHERI_PERM_STORE_CAP));
++}
++#endif
++
+ /* Diagnostic consumer only: this does not change native code emission. */
+ static void inspect_object_meta(const struct bpf_prog *prog)
+ {
+@@ -1671,6 +1690,9 @@ static void inspect_object_meta(const struct bpf_prog *prog)
+ 			aux->name, i, insn->dst_reg, meta->map_index,
+ 			map->map_type, map->value_size, map->map_flags,
+ 			!!(access & BPF_MAP_CAN_READ), !!(access & BPF_MAP_CAN_WRITE));
++#ifdef CONFIG_ARM64_MORELLO
++		inspect_array_storage_cap(map, meta->map_index);
++#endif
+ 	}
+ }
+ 
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 03d4b573e..4117bf4d5 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1764,6 +1764,9 @@ struct bpf_array {
+ 	u32 elem_size;
+ 	u32 index_mask;
+ 	struct bpf_array_aux *aux;
++#ifdef CONFIG_ARM64_MORELLO
++	struct bpf_array_authority *authority;
++#endif
+ 	union {
+ 		DECLARE_FLEX_ARRAY(char, value) __aligned(8);
+ 		DECLARE_FLEX_ARRAY(void *, ptrs) __aligned(8);
+@@ -1771,6 +1774,11 @@ struct bpf_array {
+ 	};
+ };
+ 
++#ifdef CONFIG_ARM64_MORELLO
++/* Trusted kernel callers must hold a reference to the map. */
++void * __capability bpf_array_storage_cap(const struct bpf_map *map);
++#endif
++
+ #define BPF_COMPLEXITY_LIMIT_INSNS      1000000 /* yes. 1M insns */
+ #define MAX_TAIL_CALL_CNT 33
+ 
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index c85ff9162..f28908c30 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -4,6 +4,7 @@
+  */
+ #include <linux/bpf.h>
+ #include <linux/btf.h>
++#include <linux/cheri.h>
+ #include <linux/err.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
+@@ -19,6 +20,62 @@
+ 	(BPF_F_NUMA_NODE | BPF_F_MMAPABLE | BPF_F_ACCESS_MASK | \
+ 	 BPF_F_PRESERVE_ELEMS | BPF_F_INNER_MAP)
+ 
++#ifdef CONFIG_ARM64_MORELLO
++/* Separate kmalloc storage keeps the parent outside Leaf's vmalloc RDDC. */
++struct bpf_array_authority {
++	void * __capability storage;
++};
++
++static void array_map_init_authority(struct bpf_array *array)
++{
++	struct bpf_map *map = &array->map;
++	struct bpf_array_authority *authority;
++	cheri_perms_t perms = CHERI_PERM_GLOBAL;
++	void * __capability cap;
++	u64 length = (u64)map->max_entries * array->elem_size;
++	u32 access = bpf_map_flags_to_cap(map);
++
++	if (map->map_type != BPF_MAP_TYPE_ARRAY)
++		return;
++	if (access & BPF_MAP_CAN_READ)
++		perms |= CHERI_PERM_LOAD;
++	if (access & BPF_MAP_CAN_WRITE)
++		perms |= CHERI_PERM_STORE;
++
++	/* Only the allocator supplies this address and extent, never BPF code. */
++	cap = cheri_address_set(cheri_ddc_get(), (unsigned long)array->value);
++	cap = cheri_bounds_set_exact(cap, length);
++	cap = cheri_perms_and(cap, perms);
++	if (!cheri_tag_get(cap) ||
++	    cheri_base_get(cap) != (unsigned long)array->value ||
++	    cheri_length_get(cap) != length || cheri_perms_get(cap) != perms)
++		return;
++
++	authority = kzalloc(sizeof(*authority), GFP_KERNEL_ACCOUNT);
++	if (!authority)
++		return;
++	authority->storage = cap;
++	array->authority = authority;
++	pr_info("BPF_ARRAY_ROOT stage=alloc value_size=%u stride=%u max_entries=%u length=%llu tag=%d\n",
++		map->value_size, array->elem_size, map->max_entries, length,
++		cheri_tag_get(cap));
++}
++
++void * __capability bpf_array_storage_cap(const struct bpf_map *map)
++{
++	const struct bpf_array *array;
++
++	if (map->map_type != BPF_MAP_TYPE_ARRAY)
++		return NULL;
++	array = container_of(map, struct bpf_array, map);
++	return array->authority ? array->authority->storage : NULL;
++}
++#else
++static void array_map_init_authority(struct bpf_array *array)
++{
++}
++#endif
++
+ static void bpf_array_free_percpu(struct bpf_array *array)
+ {
+ 	int i;
+@@ -151,6 +208,9 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
++	/* Optional authority: only protected program admission requires it. */
++	array_map_init_authority(array);
++
+ 	return &array->map;
+ }
+ 
+@@ -435,6 +495,9 @@ static void array_map_free(struct bpf_map *map)
+ 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+ 		bpf_array_free_percpu(array);
+ 
++#ifdef CONFIG_ARM64_MORELLO
++	kfree_sensitive(array->authority);
++#endif
+ 	if (array->map.map_flags & BPF_F_MMAPABLE)
+ 		bpf_map_area_free(array_map_vmalloc_addr(array));
+ 	else

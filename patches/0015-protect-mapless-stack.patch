@@ -1,0 +1,254 @@
+Subject: [PATCH 15] bpf: protect mapless stack-only programs
+
+Select the existing exact-frame path for a verified SOCKET_FILTER with stack
+use and no map. Publish its stack access metadata, require the protected JIT,
+and omit the map gateway and per-program vmalloc stack. Unsupported accesses
+still reject.
+
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index a9dc8126a..f78e2d9df 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -288,7 +288,8 @@ void * __capability bpf_object_value_cap(struct bpf_cap_context *ctx,
+ 	return result;
+ }
+ 
+-void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size)
++void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size,
++		       bool object_gate)
+ {
+ 	void * __capability ddc;
+ 	void * __capability rcsp;
+@@ -363,7 +364,7 @@ void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size)
+ 	 */
+ 	clr = cheri_address_set(ddc, (u64)ret_addr);
+ 	clr = cheri_sentry_create(clr);
+-	if (frame_size)
++	if (object_gate)
+ 		gate = cheri_sentry_create(cheri_address_set(ddc,
+ 						 (u64)bpf_object_cap_gate));
+ 	__asm__ volatile(
+@@ -473,18 +474,20 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 	emit(A64_PUSH(A64_R(25), A64_R(26), A64_SP), ctx);
+ 	emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
+ 	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
+-	if (ctx->object_map) {
++	if (prog->aux->object_caps) {
+ 		/* Reserve fresh data without exposing previous kernel-stack bytes. */
+ 		for (u32 offset = 0; offset < ctx->stack_size; offset += 16)
+ 			emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
+ 		emit(A64_MOV(1, A64_R(0), A64_SP), ctx);
+-		/* Private executive stack context; the gate ignores BPF map args. */
+-		BUILD_BUG_ON(sizeof(struct bpf_cap_context) != 32 ||
+-			     offsetof(struct bpf_cap_context, active) != 16);
+-		/* Integer stores initialize the active-capability slot to NULL. */
+-		emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
+-		emit_addr_mov_i64(A64_R(10), (u64)ctx->object_map, ctx);
+-		emit(A64_PUSH(A64_R(10), A64_ZR, A64_SP), ctx);
++		if (ctx->object_map) {
++			/* Private executive context; the gate ignores BPF map args. */
++			BUILD_BUG_ON(sizeof(struct bpf_cap_context) != 32 ||
++				     offsetof(struct bpf_cap_context, active) != 16);
++			/* Integer stores initialize the active slot to NULL. */
++			emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
++			emit_addr_mov_i64(A64_R(10), (u64)ctx->object_map, ctx);
++			emit(A64_PUSH(A64_R(10), A64_ZR, A64_SP), ctx);
++		}
+ 	} else {
+ 		emit_addr_mov_i64(A64_R(0), (const u64)ctx->stack, ctx);
+ 	}
+@@ -495,11 +498,13 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 	 *	      exiting restricted mode
+ 	 *	arg3: image size
+ 	 *	arg4: protected frame size, or zero for the legacy stack
++	 *	arg5: whether a map gateway is needed
+ 	 */
+ 	/* byte offset = idx * sizeof(inst) + sizeof(emit_call) */
+ 	emit(A64_ADR(A64_R(1), (epilogue_offset(ctx)*4)+4), ctx);
+ 	emit_a64_mov_i(0, A64_R(2), ctx->image_size, ctx);
+-	emit_a64_mov_i(0, A64_R(3), ctx->object_map ? ctx->stack_size : 0, ctx);
++	emit_a64_mov_i(0, A64_R(3), prog->aux->object_caps ? ctx->stack_size : 0, ctx);
++	emit_a64_mov_i(0, A64_R(4), !!ctx->object_map, ctx);
+ 	emit_call((const u64)bpf_enter_sandbox, ctx);
+ 	/* ----> Now we're in restricted mode */
+ 
+@@ -528,7 +533,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 	emit(A64_SUB_I(1, fpb, fp, ctx->fpb_offset), ctx);
+ 
+ 	/* Set up function call stack */
+-	if (ctx->object_map) {
++	if (prog->aux->object_caps) {
+ 		const u8 tmp = bpf2a64[TMP_REG_1];
+ 
+ 		/* Integer SUB SP would clear the tag before we derive the frame. */
+@@ -838,8 +843,9 @@ static void build_epilogue(struct jit_ctx *ctx)
+ 	 */
+ 	emit(0xc2c253c0, ctx); // ret clr
+ 	/* ----> Now we're back in executive mode */
+-	if (ctx->object_map)
+-		emit(A64_ADD_I(1, A64_SP, A64_SP, sizeof(struct bpf_cap_context) + ctx->stack_size), ctx);
++	if (ctx->prog->aux->object_caps)
++		emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size +
++			(ctx->object_map ? sizeof(struct bpf_cap_context) : 0)), ctx);
+ 
+ 	/* Restore x19-x28 */
+ 	emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
+@@ -1061,7 +1067,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 	int ret;
+ 	bool sign_extend;
+ 
+-	if (ctx->object_map) {
++	if (ctx->prog->aux->object_caps) {
+ 		const struct bpf_object_meta *meta = &ctx->prog->aux->object_meta[i];
+ 
+ 		if (meta->kind != BPF_OBJECT_NATIVE)
+@@ -1882,13 +1888,13 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ {
+ 	const struct bpf_prog *prog = ctx->prog;
+ 	const struct bpf_prog_aux *aux = prog->aux;
+-	const struct bpf_map *map;
++	const struct bpf_map *map = NULL;
+ 	const struct bpf_array *array = NULL;
+ 	void * __capability parent;
+ 	unsigned long mask;
+ 	u32 i, counts[BPF_OBJECT_UNSUPPORTED] = {};
+-	u32 value_size;
+-	bool ring;
++	u32 value_size = 0;
++	bool ring = false;
+ 
+ 	if (!aux->object_caps)
+ 		return 0;
+@@ -1902,15 +1908,17 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 	 * reachable through Leaf's vmalloc RDDC (including via kernel stacks).
+ 	 */
+ 	if (IS_ENABLED(CONFIG_VMAP_STACK) || prog->is_func || prog->blinded ||
+-	    prog->type != BPF_PROG_TYPE_SOCKET_FILTER || aux->used_map_cnt != 1 ||
++	    prog->type != BPF_PROG_TYPE_SOCKET_FILTER || aux->used_map_cnt > 1 ||
+ 	    !aux->object_meta || aux->object_meta_len != prog->len)
+ 		goto unsupported_profile;
+-	map = aux->used_maps[0];
+-	ring = map->map_type == BPF_MAP_TYPE_RINGBUF;
+-	value_size = ring ? BPF_CAP_RINGBUF_SIZE : map->value_size;
+-	if (map->record)
+-		goto unsupported_profile;
+-	if (map->map_type == BPF_MAP_TYPE_ARRAY) {
++	if (aux->used_map_cnt) {
++		map = aux->used_maps[0];
++		ring = map->map_type == BPF_MAP_TYPE_RINGBUF;
++		value_size = ring ? BPF_CAP_RINGBUF_SIZE : map->value_size;
++		if (map->record)
++			goto unsupported_profile;
++	}
++	if (map && map->map_type == BPF_MAP_TYPE_ARRAY) {
+ 		if (!(map->map_flags & BPF_F_MMAPABLE))
+ 			goto unsupported_profile;
+ 		array = container_of(map, struct bpf_array, map);
+@@ -1928,7 +1936,7 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		if (!cheri_tag_get(parent) ||
+ 		    cheri_length_get(parent) != 2ULL * map->max_entries)
+ 			goto unsupported_profile;
+-	} else if (!bpf_hash_capable(map)) {
++	} else if (map && !bpf_hash_capable(map)) {
+ 		goto unsupported_profile;
+ 	}
+ 
+@@ -1939,6 +1947,11 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		bool ring_call = meta->kind >= BPF_OBJECT_RING_RESERVE &&
+ 				 meta->kind <= BPF_OBJECT_RING_DISCARD;
+ 
++		/* A mapless program has no map authority to propagate. */
++		if (!map && meta->kind >= BPF_OBJECT_ARRAY_VALUE_RESULT &&
++		    meta->kind <= BPF_OBJECT_MAP_STORE)
++			goto unsupported_insn;
++
+ 		/* Only dedicated lookup/reservation gateways cross helper boundaries. */
+ 		if (class == BPF_JMP32 ||
+ 		    (class == BPF_JMP && ((op == BPF_CALL && meta->kind != BPF_OBJECT_HASH_LOOKUP && !ring_call) ||
+@@ -1968,7 +1981,7 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_HASH_LOOKUP:
+-			if (map->map_type != BPF_MAP_TYPE_HASH || meta->map_index ||
++			if (!map || map->map_type != BPF_MAP_TYPE_HASH || meta->map_index ||
+ 			    insn->code != (BPF_JMP | BPF_CALL) ||
+ 			    insn->dst_reg || insn->src_reg || insn->off ||
+ 			    insn->imm != BPF_FUNC_map_lookup_elem)
+@@ -2040,7 +2053,10 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		}
+ 		counts[meta->kind]++;
+ 	}
+-	if (ring) {
++	if (!map) {
++		if (!counts[BPF_OBJECT_STACK_LOAD] && !counts[BPF_OBJECT_STACK_STORE])
++			goto unsupported_profile;
++	} else if (ring) {
+ 		if (counts[BPF_OBJECT_RING_RESERVE] != 1 ||
+ 		    counts[BPF_OBJECT_RING_SUBMIT] + counts[BPF_OBJECT_RING_DISCARD] != 1)
+ 			goto unsupported_profile;
+@@ -2048,16 +2064,17 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		goto unsupported_profile;
+ 	}
+ 	ctx->object_map = map;
+-	pr_debug("BPF_ARRAY_CAP stage=jit prog=%s lookups=%u copies=%u offsets=%u loads=%u stores=%u\n",
+-		aux->name, counts[BPF_OBJECT_ARRAY_VALUE_RESULT],
+-		counts[BPF_OBJECT_MAP_COPY], counts[BPF_OBJECT_MAP_OFFSET],
+-		counts[BPF_OBJECT_MAP_LOAD], counts[BPF_OBJECT_MAP_STORE]);
++	if (map)
++		pr_debug("BPF_ARRAY_CAP stage=jit prog=%s lookups=%u copies=%u offsets=%u loads=%u stores=%u\n",
++			 aux->name, counts[BPF_OBJECT_ARRAY_VALUE_RESULT],
++			 counts[BPF_OBJECT_MAP_COPY], counts[BPF_OBJECT_MAP_OFFSET],
++			 counts[BPF_OBJECT_MAP_LOAD], counts[BPF_OBJECT_MAP_STORE]);
+ 	pr_debug("BPF_STACK_CAP prog=%s frame_size=%u exact=1 read=1 write=1 cap_load=0 cap_store=0 copies=%u offsets=%u loads=%u stores=%u\n",
+ 		aux->name, ctx->stack_size, counts[BPF_OBJECT_STACK_COPY],
+ 		counts[BPF_OBJECT_STACK_OFFSET], counts[BPF_OBJECT_STACK_LOAD],
+ 		counts[BPF_OBJECT_STACK_STORE]);
+ 	pr_info("BPF_MEDIATION prog=%s map_type=%u value_size=%u frame_size=%u lookups=%u reserves=%u releases=%u memory_ops=%u rddc_perms=0 jit_only=1\n",
+-		aux->name, map->map_type, value_size, ctx->stack_size,
++		aux->name, map ? map->map_type : 0, value_size, ctx->stack_size,
+ 		counts[BPF_OBJECT_ARRAY_VALUE_RESULT] + counts[BPF_OBJECT_HASH_LOOKUP],
+ 		counts[BPF_OBJECT_RING_RESERVE],
+ 		counts[BPF_OBJECT_RING_SUBMIT] + counts[BPF_OBJECT_RING_DISCARD],
+@@ -2171,7 +2188,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 		goto out_off;
+ 	}
+ 
+-	if (!ctx.object_map) {
++	if (!prog->aux->object_caps) {
+ 		header->stack = bpf_jit_alloc_stack();
+ 		if (!header->stack) {
+ 			bpf_jit_binary_free(header);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 13c3ff699..5b34f629f 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19582,12 +19582,16 @@ static int publish_object_meta(struct bpf_verifier_env *env)
+ 	struct bpf_object_meta *meta;
+ 	u32 i, count = 0;
+ 
+-	if (IS_ENABLED(CONFIG_ARM64_MORELLO))
++	if (IS_ENABLED(CONFIG_ARM64_MORELLO)) {
+ 		for (i = 0; i < env->used_map_cnt; i++)
+ 			if (env->used_maps[i]->map_type == BPF_MAP_TYPE_ARRAY ||
+ 			    env->used_maps[i]->map_type == BPF_MAP_TYPE_HASH ||
+ 			    env->used_maps[i]->map_type == BPF_MAP_TYPE_RINGBUF)
+ 				prog->aux->object_caps = true;
++		if (!env->used_map_cnt && prog->type == BPF_PROG_TYPE_SOCKET_FILTER &&
++		    prog->aux->stack_depth)
++			prog->aux->object_caps = true;
++	}
+ 
+ 	/* Subprogram JIT and constant blinding need their own metadata handling. */
+ 	if (env->subprog_cnt != 1 || prog->blinding_requested ||
+@@ -19597,7 +19601,10 @@ static int publish_object_meta(struct bpf_verifier_env *env)
+ 	for (i = 0; i < prog->len; i++)
+ 		count += env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_ARRAY_VALUE_RESULT ||
+ 			 env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_HASH_LOOKUP ||
+-			 env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_RING_RESERVE;
++			 env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_RING_RESERVE ||
++			 (!env->used_map_cnt && prog->aux->object_caps &&
++			  (env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_STACK_LOAD ||
++			   env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_STACK_STORE));
+ 	if (!count)
+ 		return prog->aux->object_caps ? -EOPNOTSUPP : 0;
+ 

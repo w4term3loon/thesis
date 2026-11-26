@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+/bin/program
+echo 'PASS bounded variable ARRAY access: ADD/SUB LOAD/STORE result=85'

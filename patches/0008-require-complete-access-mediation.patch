@@ -1,0 +1,230 @@
+Subject: [PATCH 8] bpf: require complete access mediation in the protected profile
+
+Base: patches 0001-0004 and 0006 on the pinned Leaf RFC.
+
+Classify verified non-memory operations explicitly. Label the recognized
+ARRAY lookup expansion, then require every final instruction to have a
+supported capability operation or an explicitly allowed non-memory record.
+Only the checked second half of LD_IMM64 is unmarked data. Unhandled rewrites
+and inconsistent contracts fail closed; a second emission guard prevents
+memory opcodes from reaching the legacy JIT emitter.
+
+Clear all RDDC permissions for protected execution. Stack/value capabilities
+and executive-mode gateway authority are independent of RDDC. The existing
+JIT-only requirement remains. This does not broaden the supported instruction,
+map, helper or program-type profile, and does not claim temporal safety.
+
+Reject pointer arithmetic whose resulting cursor leaves its object/frame
+(one-past is allowed). A distant excursion can clear a capability tag even
+when a later inverse operation brings the integer address back in bounds.
+Use the existing offset metadata; do not re-mint authority to repair tags.
+
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index d26201516..15a1b2cb3 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -295,10 +295,14 @@ void bpf_enter_sandbox(void *sp, void *ret_addr, int image_size, u32 frame_size
+ 	rcsp = cheri_offset_set(rcsp, stack_size);
+ 	asm volatile("msr rcsp_el0, %[RCSP]" :: [RCSP] "C" (rcsp));
+ 
+-	/* Restrict RDDC to the vmalloc region */
++	/* Protected BPF has no ambient data authority. Explicit stack/value
++	 * capabilities work independently; the gate uses the executive DDC.
++	 * Keep Leaf's original RDDC policy for unprotected programs.
++	 */
+ 	rddc = cheri_address_set(ddc, VMALLOC_START);
+ 	rddc = cheri_bounds_set(rddc, VMALLOC_END - VMALLOC_START);
+-	rddc = cheri_perms_clear(rddc, PERM_EXECUTIVE | PERM_SYS_REG);
++	rddc = cheri_perms_clear(rddc, frame_size ? ~0UL :
++				PERM_EXECUTIVE | PERM_SYS_REG);
+ 	asm volatile("msr rddc_el0, %[RDDC]" :: [RDDC] "C" (rddc));
+ 
+ 	/*
+@@ -897,12 +901,30 @@ static int add_exception_handler(const struct bpf_insn *insn,
+ 	return 0;
+ }
+ 
+-/* JITs an eBPF instruction.
+- * Returns:
+- * 0  - successfully JITed an 8-byte eBPF instruction.
+- * >0 - successfully JITed a 16-byte eBPF instruction.
+- * <0 - failed to JIT.
+- */
++/* Unknown metadata is not an implicit license to use the native emitter. */
++static bool cap_native_insn(const struct bpf_insn *insn)
++{
++	u8 class = BPF_CLASS(insn->code);
++
++	/* These ALU cases emit register operations, never implicit memory calls. */
++	if (class == BPF_ALU || class == BPF_ALU64)
++		return true;
++	if (insn->code == (BPF_LD | BPF_IMM | BPF_DW))
++		return true;
++	if (class != BPF_JMP)
++		return false;
++	switch (BPF_OP(insn->code)) {
++	case BPF_JA: case BPF_JEQ: case BPF_JNE: case BPF_JSET:
++	case BPF_JGT: case BPF_JGE: case BPF_JLT: case BPF_JLE:
++	case BPF_JSGT: case BPF_JSGE: case BPF_JSLT: case BPF_JSLE:
++	case BPF_EXIT:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* Capability operations never fall back to integer-address memory accesses. */
+ static int emit_array_cap_insn(const struct bpf_insn *insn,
+ 			       const struct bpf_object_meta *meta,
+ 			       struct jit_ctx *ctx)
+@@ -995,9 +1017,15 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 	int ret;
+ 	bool sign_extend;
+ 
+-	if (ctx->array_map && ctx->prog->aux->object_meta[i].kind)
+-		return emit_array_cap_insn(insn,
+-					   &ctx->prog->aux->object_meta[i], ctx);
++	if (ctx->array_map) {
++		const struct bpf_object_meta *meta = &ctx->prog->aux->object_meta[i];
++
++		if (meta->kind != BPF_OBJECT_NATIVE)
++			return emit_array_cap_insn(insn, meta, ctx);
++		/* No unknown record or memory opcode may reach the legacy emitter. */
++		if (!cap_native_insn(insn))
++			return -EOPNOTSUPP;
++	}
+ 
+ 	switch (code) {
+ 	/* dst = src */
+@@ -1858,8 +1886,19 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 		    (class == BPF_STX && BPF_MODE(insn->code) == BPF_ATOMIC))
+ 			goto unsupported_insn;
+ 		switch (meta->kind) {
+-		case BPF_OBJECT_NONE:
+-			continue;
++		case BPF_OBJECT_NATIVE:
++			if (!cap_native_insn(insn) || meta->map_index ||
++			    meta->access_off || meta->access_size)
++				goto unsupported_insn;
++			if (insn->code == (BPF_LD | BPF_IMM | BPF_DW)) {
++				/* The second slot is data, not an unclassified instruction. */
++				if (i + 1 >= prog->len || insn[1].code ||
++				    insn[1].dst_reg || insn[1].src_reg || insn[1].off ||
++				    aux->object_meta[i + 1].kind != BPF_OBJECT_NONE)
++					goto unsupported_insn;
++				i++;
++			}
++			break;
+ 		case BPF_OBJECT_ARRAY_VALUE_RESULT:
+ 			if (meta->map_index ||
+ 			    insn->code != (BPF_ALU64 | BPF_ADD | BPF_X) ||
+@@ -1882,6 +1921,10 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 			if (insn->code != (BPF_ALU64 | BPF_ADD | BPF_K) &&
+ 			    insn->code != (BPF_ALU64 | BPF_SUB | BPF_K))
+ 				goto unsupported_insn;
++			if (meta->map_index || meta->access_size ||
++			    meta->access_off > (meta->kind == BPF_OBJECT_STACK_OFFSET ?
++					ctx->stack_size : map->value_size))
++				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_ARRAY_LOAD:
+ 		case BPF_OBJECT_STACK_LOAD:
+@@ -1929,11 +1972,14 @@ static int prepare_array_caps(struct jit_ctx *ctx)
+ 		aux->name, ctx->stack_size, counts[BPF_OBJECT_STACK_COPY],
+ 		counts[BPF_OBJECT_STACK_OFFSET], counts[BPF_OBJECT_STACK_LOAD],
+ 		counts[BPF_OBJECT_STACK_STORE]);
++	pr_info("BPF_MEDIATION prog=%s memory_ops=%u rddc_perms=0 jit_only=1\n",
++		aux->name, counts[BPF_OBJECT_ARRAY_LOAD] + counts[BPF_OBJECT_ARRAY_STORE] +
++		counts[BPF_OBJECT_STACK_LOAD] + counts[BPF_OBJECT_STACK_STORE]);
+ 	return 0;
+ 
+ unsupported_insn:
+-	pr_err("BPF_ARRAY_CAP prog=%s unsupported_pc=%u kind=%u\n",
+-	       aux->name, i, aux->object_meta[i].kind);
++	pr_err("BPF_MEDIATION prog=%s unsupported_pc=%u kind=%u code=%#x\n",
++	       aux->name, i, aux->object_meta[i].kind, prog->insnsi[i].code);
+ 	return -EOPNOTSUPP;
+ unsupported_profile:
+ 	pr_err("BPF_ARRAY_CAP prog=%s unsupported_profile\n", aux->name);
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 3fe39291d..266f33008 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1414,6 +1414,7 @@ enum bpf_object_kind {
+ 	BPF_OBJECT_STACK_LOAD,
+ 	BPF_OBJECT_STACK_STORE,
+ 	BPF_OBJECT_STACK_KEY,
++	BPF_OBJECT_NATIVE, /* Explicitly classified non-memory instruction. */
+ 	BPF_OBJECT_UNSUPPORTED,
+ };
+ 
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 2a503d433..8a49ff7d7 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -17417,7 +17417,7 @@ static void record_array_value_use(struct bpf_verifier_env *env,
+ {
+ 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+ 	u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
+-	u8 kind = BPF_OBJECT_NONE;
++	u8 kind = BPF_OBJECT_NATIVE;
+ 	u32 access_off = 0;
+ 	u8 access_size = 0;
+ 	bool dst, src, dst_stack, src_stack;
+@@ -17513,6 +17513,25 @@ static void record_array_value_use(struct bpf_verifier_env *env,
+ 			access_size = size;
+ 		}
+ 	}
++	if (kind == BPF_OBJECT_ARRAY_OFFSET || kind == BPF_OBJECT_STACK_OFFSET) {
++		const struct bpf_reg_state *reg = &regs[insn->dst_reg];
++		s64 off, delta = insn->imm;
++
++		/* Returning in bounds cannot restore a tag lost on an excursion. */
++		if (op == BPF_SUB)
++			delta = -delta;
++		if (!tnum_is_const(reg->var_off) ||
++		    check_add_overflow((s64)reg->var_off.value, (s64)reg->off, &off) ||
++		    check_add_overflow(off, delta, &off) ||
++		    (dst_stack ? off > 0 || off < -MAX_BPF_STACK :
++				 off < 0 || off > U32_MAX)) {
++			kind = BPF_OBJECT_UNSUPPORTED;
++		} else {
++			/* OFFSET records the resulting cursor; JIT checks final size. */
++			access_off = dst_stack ? -off : off;
++		}
++	}
++
+ 	/* A single contract must hold on every explored path; never widen it. */
+ 	if (aux->object_meta_seen &&
+ 	    (aux->object_meta.kind != kind ||
+@@ -19495,7 +19514,7 @@ static void record_array_lookup_result(struct bpf_verifier_env *env,
+ {
+ 	struct bpf_object_meta *meta;
+ 	const struct bpf_insn *insn;
+-	u32 map_index, pc;
++	u32 map_index, pc, i;
+ 
+ 	if (env->subprog_cnt != 1 || env->prog->blinding_requested ||
+ 	    map->map_type != BPF_MAP_TYPE_ARRAY || map->record || cnt < 3 ||
+@@ -19522,14 +19522,19 @@ static void record_array_lookup_result(struct bpf_verifier_env *env,
+ 	if (map_index == env->used_map_cnt)
+ 		return;
+ 
++	/* Only this recognized expansion may replace the call's contract.
++	 * The JIT independently checks that NATIVE cannot describe a memory op.
++	 */
++	for (i = off; i < off + cnt; i++)
++		env->insn_aux_data[i].object_meta = (struct bpf_object_meta) {
++			.kind = BPF_OBJECT_NATIVE,
++		};
+ 	meta = &env->insn_aux_data[pc].object_meta;
+ 	meta->kind = BPF_OBJECT_ARRAY_VALUE_RESULT;
+ 	meta->map_index = map_index;
+ 	meta = &env->insn_aux_data[off + 1].object_meta;
+ 	*meta = *key;
+ 	meta->kind = BPF_OBJECT_STACK_LOAD;
+-	/* The original call's record moved onto the generated NULL assignment. */
+-	env->insn_aux_data[off + cnt - 1].object_meta = (struct bpf_object_meta){};
+ }
+ 
+ static int publish_object_meta(struct bpf_verifier_env *env)

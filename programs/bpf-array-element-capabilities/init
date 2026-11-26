@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+/bin/program
+printf '<6>array element capabilities: positive checks passed\n' > /dev/kmsg

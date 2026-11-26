@@ -1,0 +1,577 @@
+Subject: [PATCH 13] bpf: confine one ring-buffer reservation to its payload
+
+Base: patches 0001-0004, 0006, 0008, 0010 and 0011. Protect one 31-byte
+reservation per invocation, with reserve and submit/discard flags fixed to zero.
+Keep the double-mapped storage parent and active reservation in trusted state.
+Derive exact payload bounds from the actual reservation, and use the existing
+object-relative access emitter and zero-permission RDDC. Storage authority is
+optional at map creation; protected program admission requires it.
+
+The Executive gateway matches the supplied release capability exactly against
+its private active copy, then commits only the recorded address. Rejected
+release arguments discard only that recorded reservation. No unchecked BPF
+address is converted to a header pointer. Existing verifier reference rules
+remain necessary; clearing the private slot does not revoke aliases.
+
+Synchronous BPF re-entry from these gateways is unsupported. Assert that
+restricted stack/data system registers are unchanged before returning to BPF;
+do not attempt to restore or support a nested sandbox.
+
+diff --git a/arch/arm64/net/bpf_array_cap.S b/arch/arm64/net/bpf_array_cap.S
+index 5c0aad457..9e8eefd07 100644
+--- a/arch/arm64/net/bpf_array_cap.S
++++ b/arch/arm64/net/bpf_array_cap.S
+@@ -3,8 +3,9 @@
+ 
+ /*
+  * The sentry switches to the executive stack. Its top holds the map pinned by
+- * the JIT prologue, not a BPF-supplied map argument. X7 is the ARRAY address
+- * or a scalar HASH key already read through its protected stack window.
++ * the JIT prologue, not a BPF-supplied map argument, and one active reservation.
++ * X7 is the ARRAY address, bounded-read HASH key, or RING size/flags.
++ * For RING, C0 carries the supplied payload capability and X12 the operation.
+  * Save/restore whole capabilities: the hybrid C ABI alone preserves only Xn.
+  * Restoring every register except the child in C7 also removes all kernel
+  * temporaries (including any parent capabilities) before returning to BPF.
+@@ -14,8 +15,10 @@ SYM_FUNC_START(bpf_object_cap_gate)
+ 	.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+ 	str c\n, [sp, #(\n * 16)]
+ 	.endr
+-	ldr x0, [sp, #512]
++	add x0, sp, #512
+ 	mov x1, x7
++	ldr c2, [sp, #0]
++	mov x3, x12
+ 	bl bpf_object_value_cap
+ 	str c0, [sp, #(7 * 16)]
+ 	.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index bfd4e3708..ab0f39752 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -274,11 +274,31 @@ static bool is_lsi_offset(int offset, int scale)
+ /* The map comes from the private executive context, not BPF R1. */
+-void * __capability bpf_object_value_cap(const struct bpf_map *map,
+-				       unsigned long argument)
++void * __capability bpf_object_value_cap(struct bpf_cap_context *ctx,
++		unsigned long argument, void * __capability supplied, unsigned long op)
+ {
++	const struct bpf_map *map = ctx->map;
++	void * __capability rcsp;
++	void * __capability rddc;
++	void * __capability after_rcsp;
++	void * __capability after_rddc;
++	void * __capability result;
++
++	/* No synchronous BPF re-entry: do not resume with another sandbox's
++	 * banked state. Interrupt entry/return preserves these registers.
++	 */
++	asm volatile("mrs %0, rcsp_el0\n\tmrs %1, rddc_el0"
++		     : "=C" (rcsp), "=C" (rddc) :: "memory");
++	if (map->map_type == BPF_MAP_TYPE_RINGBUF)
++		result = bpf_ringbuf_cap(ctx, argument, supplied, op);
+-	if (map->map_type == BPF_MAP_TYPE_HASH)
+-		return bpf_hash_value_cap(map, (u32)argument);
+-	if (map->map_type == BPF_MAP_TYPE_ARRAY)
+-		return bpf_array_value_cap(map, argument);
+-	return NULL;
++	else if (map->map_type == BPF_MAP_TYPE_HASH)
++		result = bpf_hash_value_cap(map, (u32)argument);
++	else if (map->map_type == BPF_MAP_TYPE_ARRAY)
++		result = bpf_array_value_cap(map, argument);
++	else
++		result = NULL;
++	asm volatile("mrs %0, rcsp_el0\n\tmrs %1, rddc_el0"
++		     : "=C" (after_rcsp), "=C" (after_rddc) :: "memory");
++	BUG_ON(!cheri_is_equal_exact(rcsp, after_rcsp) ||
++	       !cheri_is_equal_exact(rddc, after_rddc));
++	return result;
+ }
+ 
+@@ -469,6 +473,10 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
+ 			emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
+ 		emit(A64_MOV(1, A64_R(0), A64_SP), ctx);
+ 		/* Private executive stack context; the gate ignores BPF map args. */
++		BUILD_BUG_ON(sizeof(struct bpf_cap_context) != 32 ||
++			     offsetof(struct bpf_cap_context, active) != 16);
++		/* Integer stores initialize the active-capability slot to NULL. */
++		emit(A64_PUSH(A64_ZR, A64_ZR, A64_SP), ctx);
+ 		emit_addr_mov_i64(A64_R(10), (u64)ctx->object_map, ctx);
+ 		emit(A64_PUSH(A64_R(10), A64_ZR, A64_SP), ctx);
+ 	} else {
+@@ -826,7 +834,7 @@ static void build_epilogue(struct jit_ctx *ctx)
+ 	emit(0xc2c253c0, ctx); // ret clr
+ 	/* ----> Now we're back in executive mode */
+ 	if (ctx->object_map)
+-		emit(A64_ADD_I(1, A64_SP, A64_SP, 16 + ctx->stack_size), ctx);
++		emit(A64_ADD_I(1, A64_SP, A64_SP, sizeof(struct bpf_cap_context) + ctx->stack_size), ctx);
+ 
+ 	/* Restore x19-x28 */
+ 	emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
+@@ -952,4 +960,13 @@ static int emit_object_cap_insn(const struct bpf_insn *insn,
+ 	switch (kind) {
++	case BPF_OBJECT_RING_RESERVE:
++	case BPF_OBJECT_RING_SUBMIT:
++	case BPF_OBJECT_RING_DISCARD:
++		/* R2 is a scalar size/flags; the gate saves the full supplied C0. */
++		emit(A64_MOV(1, bpf2a64[BPF_REG_0], bpf2a64[BPF_REG_2]), ctx);
++		emit_a64_mov_i(1, tmp3, insn->imm, ctx);
++		emit(M64_BLR(A64_R(23)), ctx);
++		emit(M64_MOV(A64_LR, A64_R(24)), ctx);
++		return 0;
+ 	case BPF_OBJECT_ARRAY_VALUE_RESULT:
+ 		emit(A64_ADD(1, dst, dst, src), ctx);
+ 		/* The gate returns only the child in C7 (BPF R0). */
+@@ -1862,6 +1879,8 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 	void * __capability parent;
+ 	unsigned long mask;
+ 	u32 i, counts[BPF_OBJECT_UNSUPPORTED] = {};
++	u32 value_size;
++	bool ring;
+ 
+ 	if (!aux->object_caps)
+ 		return 0;
+@@ -1879,6 +1898,8 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 	    !aux->object_meta || aux->object_meta_len != prog->len)
+ 		goto unsupported_profile;
+ 	map = aux->used_maps[0];
++	ring = map->map_type == BPF_MAP_TYPE_RINGBUF;
++	value_size = ring ? BPF_CAP_RINGBUF_SIZE : map->value_size;
+ 	if (map->record)
+ 		goto unsupported_profile;
+ 	if (map->map_type == BPF_MAP_TYPE_ARRAY) {
+@@ -1894,6 +1915,11 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		    cheri_representable_length(map->value_size) != map->value_size ||
+ 		    (((unsigned long)array->value | array->elem_size) & ~mask))
+ 			goto unsupported_profile;
++	} else if (ring) {
++		parent = bpf_ringbuf_storage_cap(map);
++		if (!cheri_tag_get(parent) ||
++		    cheri_length_get(parent) != 2ULL * map->max_entries)
++			goto unsupported_profile;
+ 	} else if (!bpf_hash_capable(map)) {
+ 		goto unsupported_profile;
+ 	}
+@@ -1902,10 +1928,12 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		const struct bpf_insn *insn = &prog->insnsi[i];
+ 		const struct bpf_object_meta *meta = &aux->object_meta[i];
+ 		u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
++		bool ring_call = meta->kind >= BPF_OBJECT_RING_RESERVE &&
++				 meta->kind <= BPF_OBJECT_RING_DISCARD;
+ 
+-		/* Only the dedicated HASH lookup may cross a helper boundary. */
++		/* Only dedicated lookup/reservation gateways cross helper boundaries. */
+ 		if (class == BPF_JMP32 ||
+-		    (class == BPF_JMP && ((op == BPF_CALL && meta->kind != BPF_OBJECT_HASH_LOOKUP) ||
++		    (class == BPF_JMP && ((op == BPF_CALL && meta->kind != BPF_OBJECT_HASH_LOOKUP && !ring_call) ||
+ 					 op == BPF_TAIL_CALL ||
+ 					 (op != BPF_EXIT && insn->off < 0))) ||
+ 		    (class == BPF_STX && BPF_MODE(insn->code) == BPF_ATOMIC))
+@@ -1932,12 +1960,24 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_HASH_LOOKUP:
+-			if (array || meta->map_index ||
++			if (map->map_type != BPF_MAP_TYPE_HASH || meta->map_index ||
+ 			    insn->code != (BPF_JMP | BPF_CALL) ||
+ 			    insn->dst_reg || insn->src_reg || insn->off ||
+ 			    insn->imm != BPF_FUNC_map_lookup_elem)
+ 				goto unsupported_insn;
+ 			break;
++		case BPF_OBJECT_RING_RESERVE:
++		case BPF_OBJECT_RING_SUBMIT:
++		case BPF_OBJECT_RING_DISCARD:
++			if (!ring || meta->map_index || meta->access_off ||
++			    meta->access_size != (meta->kind == BPF_OBJECT_RING_RESERVE ? BPF_CAP_RINGBUF_SIZE : 0) ||
++			    insn->code != (BPF_JMP | BPF_CALL) ||
++			    insn->dst_reg || insn->src_reg || insn->off ||
++			    insn->imm != (meta->kind == BPF_OBJECT_RING_RESERVE ? BPF_FUNC_ringbuf_reserve :
++					  meta->kind == BPF_OBJECT_RING_SUBMIT ? BPF_FUNC_ringbuf_submit :
++					  BPF_FUNC_ringbuf_discard))
++				goto unsupported_insn;
++			break;
+ 		case BPF_OBJECT_MAP_COPY:
+ 		case BPF_OBJECT_STACK_COPY:
+ 			if (insn->code != (BPF_ALU64 | BPF_MOV | BPF_X) || insn->off)
+@@ -1948,7 +1988,7 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 				goto unsupported_insn;
+ 			if (meta->map_index || meta->access_size ||
+ 			    meta->access_off > (meta->kind == BPF_OBJECT_STACK_OFFSET ?
+-					ctx->stack_size : map->value_size))
++					ctx->stack_size : value_size))
+ 				goto unsupported_insn;
+ 			break;
+ 		case BPF_OBJECT_MAP_LOAD:
+@@ -1969,7 +2009,7 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 
+ 			mask = cheri_representable_alignment_mask(size);
+ 			if (!size || size != bpf_size_to_bytes(BPF_SIZE(insn->code)) ||
+-			    off > map->value_size || size > map->value_size - off ||
++			    off > value_size || size > value_size - off ||
+ 			    cheri_representable_length(size) != size ||
+ 			    (array ? ((((unsigned long)array->value + off) | array->elem_size) & ~mask) :
+ 				     mask != ~0UL))
+@@ -1992,8 +2032,13 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		}
+ 		counts[meta->kind]++;
+ 	}
+-	if (!counts[BPF_OBJECT_ARRAY_VALUE_RESULT] && !counts[BPF_OBJECT_HASH_LOOKUP])
++	if (ring) {
++		if (counts[BPF_OBJECT_RING_RESERVE] != 1 ||
++		    counts[BPF_OBJECT_RING_SUBMIT] + counts[BPF_OBJECT_RING_DISCARD] != 1)
++			goto unsupported_profile;
++	} else if (!counts[BPF_OBJECT_ARRAY_VALUE_RESULT] && !counts[BPF_OBJECT_HASH_LOOKUP]) {
+ 		goto unsupported_profile;
++	}
+ 	ctx->object_map = map;
+ 	pr_debug("BPF_ARRAY_CAP stage=jit prog=%s lookups=%u copies=%u offsets=%u loads=%u stores=%u\n",
+ 		aux->name, counts[BPF_OBJECT_ARRAY_VALUE_RESULT],
+@@ -2003,9 +2048,11 @@ static int prepare_object_caps(struct jit_ctx *ctx)
+ 		aux->name, ctx->stack_size, counts[BPF_OBJECT_STACK_COPY],
+ 		counts[BPF_OBJECT_STACK_OFFSET], counts[BPF_OBJECT_STACK_LOAD],
+ 		counts[BPF_OBJECT_STACK_STORE]);
+-	pr_info("BPF_MEDIATION prog=%s map_type=%u value_size=%u frame_size=%u lookups=%u memory_ops=%u rddc_perms=0 jit_only=1\n",
+-		aux->name, map->map_type, map->value_size, ctx->stack_size,
++	pr_info("BPF_MEDIATION prog=%s map_type=%u value_size=%u frame_size=%u lookups=%u reserves=%u releases=%u memory_ops=%u rddc_perms=0 jit_only=1\n",
++		aux->name, map->map_type, value_size, ctx->stack_size,
+ 		counts[BPF_OBJECT_ARRAY_VALUE_RESULT] + counts[BPF_OBJECT_HASH_LOOKUP],
++		counts[BPF_OBJECT_RING_RESERVE],
++		counts[BPF_OBJECT_RING_SUBMIT] + counts[BPF_OBJECT_RING_DISCARD],
+ 		counts[BPF_OBJECT_MAP_LOAD] + counts[BPF_OBJECT_MAP_STORE] +
+ 		counts[BPF_OBJECT_STACK_LOAD] + counts[BPF_OBJECT_STACK_STORE] +
+ 		counts[BPF_OBJECT_HASH_LOOKUP]);
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 91302ae10..906752cf6 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1416,9 +1416,15 @@ enum bpf_object_kind {
+ 	BPF_OBJECT_STACK_KEY,
+ 	BPF_OBJECT_NATIVE, /* Explicitly classified non-memory instruction. */
+ 	BPF_OBJECT_HASH_LOOKUP, /* Consumes a bounded stack key, returns a value. */
++	BPF_OBJECT_RING_RESERVE,
++	BPF_OBJECT_RING_SUBMIT,
++	BPF_OBJECT_RING_DISCARD,
+ 	BPF_OBJECT_UNSUPPORTED,
+ };
+ 
++/* Deliberately fixed first reservation profile, excluding alignment padding. */
++#define BPF_CAP_RINGBUF_SIZE 31
++
+ /* Object identity and exact access contracts, never parent authority. */
+ struct bpf_object_meta {
+ 	u32 map_index;
+@@ -1799,13 +1805,22 @@ static inline bool bpf_hash_capable(const struct bpf_map *map)
+ }
+ 
+ #ifdef CONFIG_ARM64_MORELLO
++/* Private per-invocation Executive stack state, never reachable from BPF. */
++struct bpf_cap_context {
++	const struct bpf_map *map;
++	void * __capability active;
++};
++
+ /* Trusted kernel callers must hold a reference to the map. */
+ void * __capability bpf_array_storage_cap(const struct bpf_map *map);
+ void * __capability bpf_array_value_cap(const struct bpf_map *map,
+ 				      unsigned long address);
+ void * __capability bpf_hash_value_cap(const struct bpf_map *map, u32 key);
+-void * __capability bpf_object_value_cap(const struct bpf_map *map,
+-				       unsigned long argument);
++void * __capability bpf_ringbuf_storage_cap(const struct bpf_map *map);
++void * __capability bpf_ringbuf_cap(struct bpf_cap_context *ctx,
++		unsigned long argument, void * __capability supplied, unsigned long op);
++void * __capability bpf_object_value_cap(struct bpf_cap_context *ctx,
++		unsigned long argument, void * __capability supplied, unsigned long op);
+ #endif
+ 
+ #define BPF_COMPLEXITY_LIMIT_INSNS      1000000 /* yes. 1M insns */
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index 0ee653a93..cefbd964d 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -1,5 +1,6 @@
+ #include <linux/bpf.h>
+ #include <linux/btf.h>
++#include <linux/cheri.h>
+ #include <linux/err.h>
+ #include <linux/irq_work.h>
+ #include <linux/slab.h>
+@@ -76,6 +77,10 @@ struct bpf_ringbuf {
+ struct bpf_ringbuf_map {
+ 	struct bpf_map map;
+ 	struct bpf_ringbuf *rb;
++#ifdef CONFIG_ARM64_MORELLO
++	/* Separate 16-byte kmalloc slot: aligned, private and not mmap()'able. */
++	void * __capability *storage;
++#endif
+ };
+ 
+ /* 8-byte ring buffer record header structure */
+@@ -183,9 +188,49 @@ static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node)
+ 	return rb;
+ }
+ 
++#ifdef CONFIG_ARM64_MORELLO
++static void ringbuf_init_authority(struct bpf_ringbuf_map *map)
++{
++	void * __capability cap;
++	u64 length = 2ULL * map->map.max_entries;
++	unsigned long base = (unsigned long)map->rb->data;
++	cheri_perms_t perms = CHERI_PERM_GLOBAL | CHERI_PERM_LOAD | CHERI_PERM_STORE;
++
++	if (map->map.map_type != BPF_MAP_TYPE_RINGBUF)
++		return;
++	/* The allocator supplies the contiguous virtual extent of both aliases. */
++	cap = cheri_address_set(cheri_ddc_get(), base);
++	cap = cheri_bounds_set_exact(cap, length);
++	cap = cheri_perms_and(cap, perms);
++	if (!cheri_tag_get(cap) || cheri_base_get(cap) != base ||
++	    cheri_length_get(cap) != length || cheri_perms_get(cap) != perms)
++		return;
++	map->storage = kmalloc(sizeof(*map->storage), GFP_KERNEL_ACCOUNT);
++	if (!map->storage)
++		return;
++	*map->storage = cap;
++	pr_info("BPF_RING_ROOT storage_bytes=%llu aliases=2 tag=1 read=1 write=1 exec=0 load_cap=0 store_cap=0\n",
++		length);
++}
++
++void * __capability bpf_ringbuf_storage_cap(const struct bpf_map *map)
++{
++	const struct bpf_ringbuf_map *rb_map;
++
++	if (map->map_type != BPF_MAP_TYPE_RINGBUF)
++		return NULL;
++	rb_map = container_of(map, struct bpf_ringbuf_map, map);
++	return rb_map->storage ? *rb_map->storage : NULL;
++}
++#else
++static void ringbuf_init_authority(struct bpf_ringbuf_map *map)
++{
++}
++#endif
++
+ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
+ {
+ 	struct bpf_ringbuf_map *rb_map;
+ 
+ 	if (attr->map_flags & ~RINGBUF_CREATE_FLAG_MASK)
+ 		return ERR_PTR(-EINVAL);
+@@ -206,6 +251,8 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
+ 		bpf_map_area_free(rb_map);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
++	/* Optional until a protected program requires exact storage authority. */
++	ringbuf_init_authority(rb_map);
+ 
+ 	return &rb_map->map;
+ }
+@@ -230,6 +277,9 @@ static void ringbuf_map_free(struct bpf_map *map)
+ 
+ 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
+ 	bpf_ringbuf_free(rb_map->rb);
++#ifdef CONFIG_ARM64_MORELLO
++	kfree(rb_map->storage);
++#endif
+ 	bpf_map_area_free(rb_map);
+ }
+ 
+@@ -495,6 +545,61 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
+ 		irq_work_queue(&rb->work);
+ }
+ 
++#ifdef CONFIG_ARM64_MORELLO
++/* One reservation per invocation. The private active capability is the
++ * authority for commit: never find a header from an unchecked BPF pointer.
++ * Existing verifier reference/lifetime rules still apply; no revocation.
++ */
++void * __capability bpf_ringbuf_cap(struct bpf_cap_context *ctx,
++		unsigned long argument, void * __capability supplied, unsigned long op)
++{
++	const struct bpf_ringbuf_map *map = container_of(ctx->map, struct bpf_ringbuf_map, map);
++	void * __capability parent;
++	void * __capability cap;
++	struct bpf_ringbuf_hdr *hdr;
++	void *sample;
++	u32 size;
++
++	if (op == BPF_FUNC_ringbuf_reserve) {
++		if (argument != BPF_CAP_RINGBUF_SIZE || ctx->active)
++			goto reject;
++		sample = __bpf_ringbuf_reserve(map->rb, argument);
++		if (!sample)
++			return NULL;
++		hdr = sample - BPF_RINGBUF_HDR_SZ;
++		size = READ_ONCE(hdr->len) & ~(BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT);
++		parent = bpf_ringbuf_storage_cap(ctx->map);
++		cap = cheri_address_set(parent, (unsigned long)sample);
++		cap = cheri_bounds_set_exact(cap, size);
++		if (size != BPF_CAP_RINGBUF_SIZE || !cheri_tag_get(cap) ||
++		    cheri_base_get(cap) != (unsigned long)sample || cheri_length_get(cap) != size) {
++			bpf_ringbuf_commit(sample, BPF_RB_NO_WAKEUP, true);
++			pr_warn("BPF_RING_GATE rejected=inexact_reservation\n");
++			return NULL;
++		}
++		ctx->active = cap;
++		if ((unsigned long)sample - (unsigned long)map->rb->data + size > ctx->map->max_entries)
++			pr_info("BPF_RING_VALUE length=%u tag=1 wrap=1\n", size);
++		return cap;
++	}
++	if ((op != BPF_FUNC_ringbuf_submit && op != BPF_FUNC_ringbuf_discard) ||
++	    argument || !cheri_tag_get(ctx->active) ||
++	    !cheri_is_equal_exact(supplied, ctx->active))
++		goto reject;
++	sample = (void *)cheri_address_get(ctx->active);
++	bpf_ringbuf_commit(sample, 0, op == BPF_FUNC_ringbuf_discard);
++	ctx->active = NULL;
++	return NULL;
++reject:
++	/* Fail closed and discard only our recorded reservation, if any. */
++	pr_warn("BPF_RING_GATE rejected=reservation_contract\n");
++	if (cheri_tag_get(ctx->active))
++		bpf_ringbuf_commit((void *)cheri_address_get(ctx->active), BPF_RB_NO_WAKEUP, true);
++	ctx->active = NULL;
++	return NULL;
++}
++#endif
++
+ BPF_CALL_2(bpf_ringbuf_submit, void *, sample, u64, flags)
+ {
+ 	bpf_ringbuf_commit(sample, flags, false /* discard */);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 52562b2fd..13c3ff699 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -17404,11 +17404,23 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
+ 	return 0;
+ }
+ 
++static bool is_ringbuf_value_reg(const struct bpf_reg_state *reg)
++{
++	return base_type(reg->type) == PTR_TO_MEM && (reg->type & MEM_RINGBUF);
++}
++
++static bool cap_scalar_is(const struct bpf_reg_state *reg, u64 value)
++{
++	return reg->type == SCALAR_VALUE && tnum_is_const(reg->var_off) &&
++	       reg->var_off.value == value;
++}
++
+ static bool is_map_value_reg(const struct bpf_reg_state *reg)
+ {
+-	return base_type(reg->type) == PTR_TO_MAP_VALUE && reg->map_ptr &&
++	return is_ringbuf_value_reg(reg) ||
++	       (base_type(reg->type) == PTR_TO_MAP_VALUE && reg->map_ptr &&
+ 	       (reg->map_ptr->map_type == BPF_MAP_TYPE_ARRAY ||
+-		reg->map_ptr->map_type == BPF_MAP_TYPE_HASH);
++		reg->map_ptr->map_type == BPF_MAP_TYPE_HASH));
+ }
+ 
+ /* Retain use semantics and constant object-relative access contracts. */
+@@ -17419,7 +17431,7 @@ static void record_object_use(struct bpf_verifier_env *env,
+ 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[env->insn_idx];
+ 	u8 class = BPF_CLASS(insn->code), op = BPF_OP(insn->code);
+ 	u8 kind = BPF_OBJECT_NATIVE;
+-	u32 access_off = 0;
++	u32 access_off = 0, map_index = 0;
+ 	u8 access_size = 0;
+ 	bool dst, src, dst_stack, src_stack;
+ 	int r;
+@@ -17465,9 +17477,32 @@ static void record_object_use(struct bpf_verifier_env *env,
+ 			     bpf_hash_capable(regs[BPF_REG_1].map_ptr)) &&
+ 			    regs[BPF_REG_2].type == PTR_TO_STACK)
+ 				kind = BPF_OBJECT_STACK_KEY;
+-			/* Includes lookup keys supplied through an array-value pointer. */
++			if (!insn->src_reg && insn->imm == BPF_FUNC_ringbuf_reserve &&
++			    regs[BPF_REG_1].type == CONST_PTR_TO_MAP &&
++			    regs[BPF_REG_1].map_ptr->map_type == BPF_MAP_TYPE_RINGBUF &&
++			    cap_scalar_is(&regs[BPF_REG_2], BPF_CAP_RINGBUF_SIZE) &&
++			    cap_scalar_is(&regs[BPF_REG_3], 0)) {
++				kind = BPF_OBJECT_RING_RESERVE;
++				access_size = BPF_CAP_RINGBUF_SIZE;
++				for (; map_index < env->used_map_cnt; map_index++)
++					if (env->used_maps[map_index] == regs[BPF_REG_1].map_ptr)
++						break;
++				if (map_index == env->used_map_cnt)
++					kind = BPF_OBJECT_UNSUPPORTED;
++			}
++			if (!insn->src_reg &&
++			    (insn->imm == BPF_FUNC_ringbuf_submit || insn->imm == BPF_FUNC_ringbuf_discard) &&
++			    regs[BPF_REG_1].type == (PTR_TO_MEM | MEM_RINGBUF) &&
++			    regs[BPF_REG_1].ref_obj_id && regs[BPF_REG_1].mem_size == BPF_CAP_RINGBUF_SIZE &&
++			    !regs[BPF_REG_1].off && tnum_equals_const(regs[BPF_REG_1].var_off, 0) &&
++			    cap_scalar_is(&regs[BPF_REG_2], 0))
++				kind = insn->imm == BPF_FUNC_ringbuf_submit ?
++					BPF_OBJECT_RING_SUBMIT : BPF_OBJECT_RING_DISCARD;
++			/* The only accepted value-pointer helper argument is a release. */
+ 			for (r = BPF_REG_1; r <= BPF_REG_5; r++)
+-				if (is_map_value_reg(&regs[r]))
++				if (is_map_value_reg(&regs[r]) &&
++				    !(r == BPF_REG_1 && (kind == BPF_OBJECT_RING_SUBMIT ||
++							kind == BPF_OBJECT_RING_DISCARD)))
+ 					kind = BPF_OBJECT_UNSUPPORTED;
+ 		} else if (op != BPF_JA && (dst || (BPF_SRC(insn->code) == BPF_X && src))) {
+ 			if (class != BPF_JMP || BPF_SRC(insn->code) != BPF_K ||
+@@ -17483,14 +17518,14 @@ static void record_object_use(struct bpf_verifier_env *env,
+ 		const struct bpf_reg_state *reg = &regs[kind == BPF_OBJECT_MAP_LOAD ?
+ 						      insn->src_reg : insn->dst_reg];
+ 		int size = bpf_size_to_bytes(BPF_SIZE(insn->code));
++		u32 limit = is_ringbuf_value_reg(reg) ? reg->mem_size : reg->map_ptr->value_size;
+ 		s64 off;
+ 
+ 		/* Include prior pointer arithmetic, not just insn->off. */
+ 		if (!tnum_is_const(reg->var_off) || size <= 0 ||
+ 		    check_add_overflow((s64)reg->var_off.value, (s64)reg->off, &off) ||
+ 		    check_add_overflow(off, (s64)insn->off, &off) || off < 0 ||
+-		    off > reg->map_ptr->value_size ||
+-		    size > reg->map_ptr->value_size - off) {
++		    off > limit || size > limit - off) {
+ 			kind = BPF_OBJECT_UNSUPPORTED;
+ 		} else {
+ 			access_off = off;
+@@ -17519,10 +17554,12 @@ static void record_object_use(struct bpf_verifier_env *env,
+ 	/* A single contract must hold on every explored path; never widen it. */
+ 	if (aux->object_meta_seen &&
+ 	    (aux->object_meta.kind != kind ||
++	     aux->object_meta.map_index != map_index ||
+ 	     aux->object_meta.access_off != access_off ||
+ 	     aux->object_meta.access_size != access_size))
+ 		kind = BPF_OBJECT_UNSUPPORTED;
+ 	aux->object_meta.kind = kind;
++	aux->object_meta.map_index = map_index;
+ 	aux->object_meta.access_off = access_off;
+ 	aux->object_meta.access_size = access_size;
+ 	aux->object_meta_seen = true;
+@@ -19548,7 +19585,8 @@ static int publish_object_meta(struct bpf_verifier_env *env)
+ 	if (IS_ENABLED(CONFIG_ARM64_MORELLO))
+ 		for (i = 0; i < env->used_map_cnt; i++)
+ 			if (env->used_maps[i]->map_type == BPF_MAP_TYPE_ARRAY ||
+-			    env->used_maps[i]->map_type == BPF_MAP_TYPE_HASH)
++			    env->used_maps[i]->map_type == BPF_MAP_TYPE_HASH ||
++			    env->used_maps[i]->map_type == BPF_MAP_TYPE_RINGBUF)
+ 				prog->aux->object_caps = true;
+ 
+ 	/* Subprogram JIT and constant blinding need their own metadata handling. */
+@@ -19558,7 +19596,8 @@ static int publish_object_meta(struct bpf_verifier_env *env)
+ 
+ 	for (i = 0; i < prog->len; i++)
+ 		count += env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_ARRAY_VALUE_RESULT ||
+-			 env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_HASH_LOOKUP;
++			 env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_HASH_LOOKUP ||
++			 env->insn_aux_data[i].object_meta.kind == BPF_OBJECT_RING_RESERVE;
+ 	if (!count)
+ 		return prog->aux->object_caps ? -EOPNOTSUPP : 0;
+ 
+@@ -19758,6 +19797,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
+ 			continue;
+ 		}
+ 
++		/* Retain these calls for dedicated, fail-closed capability gateways. */
++		if (IS_ENABLED(CONFIG_ARM64_MORELLO) && !insn->src_reg &&
++		    (insn->imm == BPF_FUNC_ringbuf_reserve ||
++		     insn->imm == BPF_FUNC_ringbuf_submit || insn->imm == BPF_FUNC_ringbuf_discard))
++			continue;
++
+ 		if (insn->imm == BPF_FUNC_get_route_realm)
+ 			prog->dst_needed = 1;
+ 		if (insn->imm == BPF_FUNC_get_prandom_u32)
